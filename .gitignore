@@ -3,6 +3,8 @@
 **/dist/
 **/dist-electron/
 **/out/
+**/release/
+**/artifacts/
 **/coverage/
 
 # Secrets and local configuration
@@ -35,3 +37,6 @@ temp/
 
 # Superseded local demo file (kept locally for reference)
 /demo-data-analysis.xlsx
+
+# Local learning edition; GitHub publishes only the complete product edition.
+/apps/desktop/

@@ -28,9 +28,11 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test Agent runtime
+        run: npm test
+
       - name: Build renderer
         run: npm run build
 
       - name: Build Electron main process
         run: npm run build:electron
-

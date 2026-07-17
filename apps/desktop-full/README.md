@@ -71,6 +71,18 @@ npm install
 npm run dev:electron
 ```
 
+质量检查与 Windows 打包：
+
+```bash
+npm run lint
+npm test
+npm run build
+npm run build:electron
+npm run package:win
+```
+
+安装器输出到 `artifacts/`。用户资料、计划、报告、知识库索引和 Agent 运行记录保存在 Electron 用户数据目录，不会写入安装目录。
+
 浏览器里的 `localhost:5173` 只能预览 UI；文件读取、桌面工具和 AI 主进程调用需要使用 Electron 窗口。
 
 ## 配置

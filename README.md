@@ -6,7 +6,6 @@
 
 ```text
 apps/
-  desktop/       React + Electron 学习版，保留逐步开发过程
   desktop-full/  完整功能版，也是当前主要交付版本
 ```
 
@@ -19,6 +18,7 @@ apps/
 - 文件分析后生成报告、计划、今日任务、进度复盘和桌面悬浮报告。
 - 内置与自定义 Prompt Skill、HTTP API Tool、扩展目录自动扫描。
 - 本地知识库检索、长期记忆、出差规划和桌面提醒。
+- SQLite 持久化、FTS5 分段检索、来源片段预览和 Agent 运行历史。
 - Provider 与 Tool API Key 使用 Electron `safeStorage` 加密保存。
 
 ## 本地运行
@@ -33,9 +33,18 @@ npm run dev:electron
 
 ```bash
 npm run lint
+npm test
 npm run build
 npm run build:electron
 ```
+
+生成 Windows 安装包：
+
+```bash
+npm run package:win
+```
+
+安装器输出到 `apps/desktop-full/artifacts/`。
 
 ## 模型配置
 
@@ -55,4 +64,3 @@ ZHIPU_MODEL=glm-4-flash
 - 仓库不包含真实密钥、用户数据、Agent 运行记录和本机构建产物。
 
 详细功能和扩展格式见 [完整版本说明](apps/desktop-full/README.md)。
-

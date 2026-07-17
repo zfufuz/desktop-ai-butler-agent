@@ -1,4 +1,5 @@
 import type React from 'react'
+import { LoaderCircle, Paperclip, Send, X } from 'lucide-react'
 
 type ChatInputProps = {
   input: string
@@ -36,7 +37,7 @@ function ChatInput({
               title="点击移除文件"
             >
               <span>{attachment.name}</span>
-              <b>×</b>
+              <X aria-hidden="true" size={14} />
             </button>
           ))}
         </div>
@@ -47,8 +48,9 @@ function ChatInput({
           onClick={onAddFiles}
           disabled={isThinking}
           title="添加文件，最多 10 个"
+          aria-label="添加文件，最多 10 个"
         >
-          +
+          <Paperclip aria-hidden="true" size={18} />
         </button>
         <input
           ref={inputRef}
@@ -63,8 +65,9 @@ function ChatInput({
           disabled={isThinking}
         />
       </div>
-      <button onClick={onSend} disabled={!canSend || isThinking}>
-        发送
+      <button className="send-button" onClick={onSend} disabled={!canSend || isThinking}>
+        {isThinking ? <LoaderCircle className="spin" aria-hidden="true" size={17} /> : <Send aria-hidden="true" size={17} />}
+        <span>{isThinking ? '处理中' : '发送'}</span>
       </button>
     </footer>
   )

@@ -9,5 +9,6 @@
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["electron"]
+  "include": ["electron"],
+  "exclude": ["electron/**/*.test.ts"]
 }

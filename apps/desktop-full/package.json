@@ -3,9 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "description": "Personal desktop AI butler built with Electron, React, TypeScript, configurable model providers, skills, tools and local RAG.",
+  "author": "zfufuz",
+  "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --strictPort",
     "build": "tsc -b && vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "electron": "electron dist-electron/main.js",
@@ -13,11 +15,15 @@
     "dev:electron": "concurrently -k \"npm run dev\" \"npm run electron:dev\"",
     "package:win": "npm run build && npm run build:electron && electron-builder --win",
     "lint": "oxlint",
+    "test": "vitest run",
     "preview": "vite preview"
   },
   "dependencies": {
+    "lucide-react": "^1.24.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
@@ -26,21 +32,40 @@
     "@vitejs/plugin-react": "^6.0.2",
     "concurrently": "^10.0.3",
     "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
     "oxlint": "^1.69.0",
     "typescript": "~6.0.2",
     "vite": "^8.1.0",
+    "vitest": "^4.1.10",
     "wait-on": "^9.0.10"
   },
   "build": {
     "appId": "com.desktop.ai.butler",
     "productName": "桌面 AI 管家",
+    "artifactName": "Desktop-AI-Butler-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "artifacts"
+    },
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     }
   }
 }

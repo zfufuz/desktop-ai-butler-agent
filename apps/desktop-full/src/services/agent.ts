@@ -49,6 +49,7 @@ type PermissionRequester = (toolName: string, reason: string) => Promise<boolean
 
 type AgentOptions = {
   knowledgeDocuments: KnowledgeDocument[]
+  builtinTools?: AgentToolDefinition[]
   customTools?: CustomAgentTool[]
   context?: string
   onTimeline: TimelineLogger
@@ -204,11 +205,6 @@ async function getModelDecision(
   }
 }
 
-function scoreDocument(userText: string, document: KnowledgeDocument) {
-  const tokens = userText.toLowerCase().split(/\s+|，|。|、|；|:|\.|,|\?|？/).filter((token) => token.length >= 2)
-  return tokens.reduce((score, token) => score + (document.content.toLowerCase().includes(token) ? 1 : 0), 0)
-}
-
 async function executeTool(
   call: AgentToolCall,
   userText: string,
@@ -245,11 +241,24 @@ async function executeTool(
 
   if (call.name === 'queryKnowledgeBase') {
     const query = String(call.input.query ?? userText)
-    const topDocument = [...options.knowledgeDocuments]
-      .map((document) => ({ document, score: scoreDocument(query, document) }))
-      .sort((a, b) => b.score - a.score)[0]?.document
-    if (!topDocument) return fail('知识库为空')
-    return succeed(topDocument.name, `知识库命中文档：${topDocument.name}\n相关内容：\n${topDocument.content.slice(0, 6000)}`)
+    let results = await window.electronAPI.searchKnowledge(query, 6)
+    if (results.length === 0 && options.knowledgeDocuments.length > 0) {
+      await window.electronAPI.syncKnowledgeDocuments(options.knowledgeDocuments)
+      results = await window.electronAPI.searchKnowledge(query, 6)
+    }
+    if (results.length === 0) return fail('知识库没有检索到相关片段')
+
+    const sourceNames = [...new Set(results.map((result) => result.documentName))]
+    const context = results
+      .map(
+        (result, index) =>
+          `[${index + 1}] 来源：${result.documentName}，片段 ${result.chunkIndex + 1}\n${result.content}`,
+      )
+      .join('\n\n')
+    return succeed(
+      `命中 ${results.length} 个片段 / ${sourceNames.join('、')}`,
+      `本地知识库检索结果：\n\n${context}\n\n回答时请引用 [1]、[2] 这样的来源编号。`,
+    )
   }
 
   if (call.name.startsWith('custom:')) {
@@ -280,7 +289,10 @@ export async function runAgent(
 ): Promise<AssistantReply> {
   options.onTimeline(createTimelineStep('接收目标', userText, 'success'))
   const customTools = options.customTools ?? []
-  const tools: AgentToolDefinition[] = [...toolRegistry, ...createCustomToolDefinitions(customTools)]
+  const tools: AgentToolDefinition[] = [
+    ...(options.builtinTools ?? toolRegistry),
+    ...createCustomToolDefinitions(customTools),
+  ]
 
   const orchestrator = new AgentOrchestrator({
     tools,

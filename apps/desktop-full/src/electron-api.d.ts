@@ -108,6 +108,36 @@ type AgentRunSnapshot = {
   error?: string
 }
 
+type KnowledgeDocumentInput = {
+  id: string | number
+  name: string
+  content: string
+  createdAt: number
+}
+
+type KnowledgeSearchResult = {
+  documentId: string
+  documentName: string
+  chunkIndex: number
+  content: string
+  score: number
+}
+
+type KnowledgeDocumentSummary = {
+  id: string
+  name: string
+  createdAt: number
+  updatedAt: number
+  chunkCount: number
+  characterCount: number
+}
+
+type MemoryNote = {
+  id: string
+  text: string
+  createdAt: number
+}
+
 declare global {
   interface Window {
     electronAPI: {
@@ -132,7 +162,21 @@ declare global {
       getWorkflowData: () => Promise<ButlerWorkspaceData>
       getAgentRuns: () => Promise<AgentRunSnapshot[]>
       saveAgentRun: (run: AgentRunSnapshot) => Promise<AgentRunSnapshot>
+      syncKnowledgeDocuments: (
+        documents: KnowledgeDocumentInput[],
+      ) => Promise<Array<{ id: string; name: string; createdAt: number; chunkCount: number }>>
+      getKnowledgeDocuments: () => Promise<KnowledgeDocumentSummary[]>
+      upsertKnowledgeDocument: (
+        document: KnowledgeDocumentInput,
+      ) => Promise<{ id: string; name: string; createdAt: number; chunkCount: number }>
+      searchKnowledge: (query: string, limit?: number) => Promise<KnowledgeSearchResult[]>
+      deleteKnowledgeDocument: (documentId: string) => Promise<{ deleted: boolean; id: string }>
+      getMemoryNotes: () => Promise<MemoryNote[]>
+      syncMemoryNotes: (notes: string[]) => Promise<MemoryNote[]>
+      addMemoryNote: (text: string) => Promise<MemoryNote[]>
+      deleteMemoryNote: (noteId: string) => Promise<MemoryNote[]>
       saveReport: (report: Omit<ButlerReport, 'id' | 'createdAt'>) => Promise<ButlerWorkspaceData>
+      deleteReport: (reportId: string) => Promise<ButlerWorkspaceData>
       savePlan: (
         plan: Omit<ButlerPlan, 'id' | 'status' | 'checkins' | 'createdAt' | 'updatedAt'>,
       ) => Promise<ButlerWorkspaceData>
@@ -140,6 +184,7 @@ declare global {
       deletePlan: (planId: string) => Promise<ButlerWorkspaceData>
       checkinPlan: (planId: string, note: string) => Promise<ButlerWorkspaceData>
       addActivity: (text: string) => Promise<ButlerWorkspaceData>
+      deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>
       notify: (title: string, body: string) => Promise<boolean>
       openFloatingReport: (reportId: string) => Promise<boolean>
       getExtensionsPath: () => Promise<string>

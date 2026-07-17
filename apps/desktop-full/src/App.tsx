@@ -1,7 +1,21 @@
 ﻿import { useEffect, useRef, useState } from 'react'
+import {
+  ChevronLeft,
+  ChevronRight,
+  FileText,
+  ListChecks,
+  Plane,
+  ReceiptText,
+  Settings,
+} from 'lucide-react'
 import './App.css'
 import AvatarPanel from './components/AvatarPanel'
+import AgentRunsPanel, { type AgentRunSnapshot } from './components/AgentRunsPanel'
 import ChatInput from './components/ChatInput'
+import KnowledgePanel, {
+  type KnowledgeDocumentSummary,
+  type KnowledgeSearchResult,
+} from './components/KnowledgePanel'
 import MessageList from './components/MessageList'
 import { createAssistantReply } from './services/assistant'
 import {
@@ -18,7 +32,7 @@ type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
 type SettingsPage = 'home' | 'provider' | 'skill' | 'tool' | 'installed'
-type WorkspacePage = 'home' | 'data' | 'reports' | 'plans' | 'activity' | 'memory'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'reports' | 'plans' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -132,6 +146,12 @@ type BuiltinOverride = {
 }
 
 type BuiltinOverrideMap = Record<string, BuiltinOverride>
+
+type MemoryNote = {
+  id: string
+  text: string
+  createdAt: number
+}
 
 function createMessageId() {
   return Date.now() + Math.random()
@@ -409,8 +429,16 @@ function App() {
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>(() =>
     readJsonFromStorage('ai-butler:knowledgeDocuments', []),
   )
-  const [memoryNotes, setMemoryNotes] = useState<string[]>(() =>
-    readJsonFromStorage('ai-butler:memoryNotes', []),
+  const [knowledgeIndex, setKnowledgeIndex] = useState<KnowledgeDocumentSummary[]>([])
+  const [knowledgeQuery, setKnowledgeQuery] = useState('')
+  const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeSearchResult[]>([])
+  const [agentRuns, setAgentRuns] = useState<AgentRunSnapshot[]>([])
+  const [memoryNotes, setMemoryNotes] = useState<MemoryNote[]>(() =>
+    readJsonFromStorage<string[]>('ai-butler:memoryNotes', []).map((text, index) => ({
+      id: `legacy-memory-${index}`,
+      text,
+      createdAt: Date.now() - index,
+    })),
   )
   const [builtinSkillOverrides, setBuiltinSkillOverrides] = useState<BuiltinOverrideMap>(() =>
     readJsonFromStorage('ai-butler:builtinSkillOverrides', {}),
@@ -510,6 +538,8 @@ function App() {
     }))
     .filter((tool) => !tool.deleted)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const hasSyncedKnowledgeRef = useRef(false)
+  const hasSyncedMemoryRef = useRef(false)
 
   function addToolLog(log: ToolCallLog) {
     setToolLogs((currentLogs) => [log, ...currentLogs].slice(0, 8))
@@ -577,7 +607,33 @@ function App() {
     window.electronAPI.getPlatformConfig().then(setPlatformConfig)
     window.electronAPI.getExtensionsPath().then(setExtensionsPath)
     window.electronAPI.getWorkflowData().then(setWorkflowData)
+    window.electronAPI.getKnowledgeDocuments().then(setKnowledgeIndex)
+    window.electronAPI.getAgentRuns().then(setAgentRuns)
+    window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
+      const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
+      const nextNotes = legacyNotes.length > 0
+        ? await window.electronAPI.syncMemoryNotes(legacyNotes)
+        : storedNotes
+      setMemoryNotes(nextNotes)
+      hasSyncedMemoryRef.current = true
+      localStorage.removeItem('ai-butler:memoryNotes')
+    })
   }, [isElectronReady])
+
+  useEffect(() => {
+    if (!isElectronReady || hasSyncedKnowledgeRef.current || knowledgeDocuments.length === 0) return
+    hasSyncedKnowledgeRef.current = true
+    window.electronAPI
+      .syncKnowledgeDocuments(knowledgeDocuments)
+      .then(() => window.electronAPI.getKnowledgeDocuments())
+      .then((documents) => {
+        setKnowledgeIndex(documents)
+        localStorage.removeItem('ai-butler:knowledgeDocuments')
+      })
+      .catch(() => {
+        hasSyncedKnowledgeRef.current = false
+      })
+  }, [isElectronReady, knowledgeDocuments])
 
   useEffect(() => {
     if (!isThinking) {
@@ -586,12 +642,14 @@ function App() {
   }, [isThinking])
 
   useEffect(() => {
+    if (isElectronReady) return
     localStorage.setItem('ai-butler:knowledgeDocuments', JSON.stringify(knowledgeDocuments))
-  }, [knowledgeDocuments])
+  }, [isElectronReady, knowledgeDocuments])
 
   useEffect(() => {
-    localStorage.setItem('ai-butler:memoryNotes', JSON.stringify(memoryNotes))
-  }, [memoryNotes])
+    if (isElectronReady && hasSyncedMemoryRef.current) return
+    localStorage.setItem('ai-butler:memoryNotes', JSON.stringify(memoryNotes.map((note) => note.text)))
+  }, [isElectronReady, memoryNotes])
 
   useEffect(() => {
     localStorage.setItem('ai-butler:builtinSkillOverrides', JSON.stringify(builtinSkillOverrides))
@@ -934,6 +992,16 @@ ${progressText}`,
     await window.electronAPI.openFloatingReport(reportId)
   }
 
+  async function deleteReport(report: ButlerReport) {
+    if (!isElectronReady || !window.confirm(`确定删除报告“${report.title}”？`)) return
+    setWorkflowData(await window.electronAPI.deleteReport(report.id))
+  }
+
+  async function deleteActivity(activity: ButlerActivity) {
+    if (!isElectronReady || !window.confirm('确定删除这条行动记录？')) return
+    setWorkflowData(await window.electronAPI.deleteActivity(activity.id))
+  }
+
   async function invokeOptionalTripTool(tool: CustomToolConfig | undefined, input: string) {
     if (!tool) {
       return '未配置对应 API Tool。'
@@ -1182,11 +1250,18 @@ ${historyContext}
           ? '当前是普通用户版，请优先用通俗表达帮助用户整理资料、分析文件、生成报告。'
           : '当前是开发者模式，可以解释 Agent、Provider、Skill、Tool、RAG、IPC 等技术细节。'
       const memoryContext =
-        memoryNotes.length > 0 ? `\n\n用户长期记忆：\n${memoryNotes.join('\n')}` : ''
+        memoryNotes.length > 0 ? `\n\n用户长期记忆：\n${memoryNotes.map((note) => note.text).join('\n')}` : ''
       let streamedMessageId: number | null = null
       let streamedContent = ''
       const assistantReply = await runAgent(text, addToolLog, {
         knowledgeDocuments,
+        builtinTools: builtinToolViews
+          .filter((tool) => tool.enabled)
+          .map(({ displayName, displayDescription, enabled: _enabled, deleted: _deleted, ...tool }) => ({
+            ...tool,
+            label: displayName,
+            description: displayDescription,
+          })),
         customTools: enabledCustomTools,
         context: `${modeHint}${memoryContext}`,
         onTimeline: addTimelineStep,
@@ -1534,24 +1609,53 @@ ${fileContext}`,
       createdAt: Date.now(),
     }
 
+    const indexedDocument = await window.electronAPI.upsertKnowledgeDocument(document)
     setKnowledgeDocuments((currentDocuments) => [document, ...currentDocuments].slice(0, 12))
+    setKnowledgeIndex(await window.electronAPI.getKnowledgeDocuments())
     addToolLog({
       id: createMessageId(),
       name: 'rag.importDocument',
       status: 'success',
-      detail: pickedFile!.name,
+      detail: `${pickedFile!.name} / ${indexedDocument.chunkCount} 个检索片段`,
       createdAt: Date.now(),
     })
   }
 
-  function rememberCurrentGoal() {
-    const note = input.trim()
-    if (!note) {
-      return
-    }
+  async function searchKnowledgeIndex() {
+    const query = knowledgeQuery.trim()
+    if (!isElectronReady || !query) return
+    setKnowledgeResults(await window.electronAPI.searchKnowledge(query, 8))
+  }
 
-    setMemoryNotes((currentNotes) => [note, ...currentNotes].slice(0, 8))
+  async function removeKnowledgeDocument(document: KnowledgeDocumentSummary) {
+    if (!isElectronReady || !window.confirm(`从资料库删除“${document.name}”？\n\n原始本地文件不会被删除。`)) return
+    await window.electronAPI.deleteKnowledgeDocument(document.id)
+    setKnowledgeDocuments((documents) => documents.filter((item) => String(item.id) !== document.id))
+    setKnowledgeResults((results) => results.filter((item) => item.documentId !== document.id))
+    setKnowledgeIndex(await window.electronAPI.getKnowledgeDocuments())
+  }
+
+  async function rememberCurrentGoal() {
+    const note = input.trim()
+    if (!note) return
+
+    if (isElectronReady) {
+      setMemoryNotes(await window.electronAPI.addMemoryNote(note))
+    } else {
+      setMemoryNotes((currentNotes) => [
+        { id: createLocalId('memory'), text: note, createdAt: Date.now() },
+        ...currentNotes,
+      ].slice(0, 8))
+    }
     setInput('')
+  }
+
+  async function removeMemoryNote(noteId: string) {
+    if (isElectronReady) {
+      setMemoryNotes(await window.electronAPI.deleteMemoryNote(noteId))
+    } else {
+      setMemoryNotes((notes) => notes.filter((note) => note.id !== noteId))
+    }
   }
 
   async function savePlatformConfig(nextConfig: AgentPlatformConfig) {
@@ -2110,7 +2214,7 @@ ${result.content}
         toolLogs,
         timeline: agentTimeline,
         knowledgeDocuments,
-        memoryNotes,
+        memoryNotes: memoryNotes.map((note) => note.text),
         addToolLog,
         addTimelineStep,
         requestPermission: requestToolPermission,
@@ -2190,7 +2294,21 @@ ${result.content}
             <strong>文件变行动</strong>
             <small>拖拽或选择文件，生成报告、计划、今日任务。</small>
           </span>
-          <b>{knowledgeDocuments.length} 份</b>
+          <b>{knowledgeIndex.length} 份</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('knowledge')}>
+          <span>
+            <strong>本地资料库</strong>
+            <small>管理已索引文档，测试检索结果和来源片段。</small>
+          </span>
+          <b>{knowledgeIndex.reduce((sum, item) => sum + item.chunkCount, 0)} 段</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('runs')}>
+          <span>
+            <strong>Agent 运行记录</strong>
+            <small>查看目标、执行轮次、工具观察和失败原因。</small>
+          </span>
+          <b>{agentRuns.length} 次</b>
         </button>
         <button className="settings-entry workspace-entry" onClick={() => startButlerScenario('expense')}>
           <span>
@@ -2264,6 +2382,25 @@ ${result.content}
       )
     }
 
+    if (workspacePage === 'knowledge') {
+      return (
+        <KnowledgePanel
+          documents={knowledgeIndex}
+          results={knowledgeResults}
+          query={knowledgeQuery}
+          disabled={isThinking || !isElectronReady}
+          onQueryChange={setKnowledgeQuery}
+          onSearch={searchKnowledgeIndex}
+          onImport={importKnowledgeDocument}
+          onRemove={removeKnowledgeDocument}
+        />
+      )
+    }
+
+    if (workspacePage === 'runs') {
+      return <AgentRunsPanel runs={agentRuns} />
+    }
+
     if (workspacePage === 'reports') {
       return (
         <div className="insight-section">
@@ -2272,9 +2409,12 @@ ${result.content}
             <div className="report-card">
               <strong>{latestReport.title}</strong>
               <p>{latestReport.summary}</p>
-              <button className="panel-action-button" onClick={() => openFloatingReport(latestReport.id)} disabled={!isElectronReady}>
-                悬浮到桌面
-              </button>
+              <div className="report-actions">
+                <button className="panel-action-button" onClick={() => openFloatingReport(latestReport.id)} disabled={!isElectronReady}>
+                  悬浮到桌面
+                </button>
+                <button onClick={() => deleteReport(latestReport)}>删除</button>
+              </div>
               <small>报告会以置顶小窗显示，方便你边工作边看结论和计划。</small>
             </div>
           ) : (
@@ -2282,9 +2422,10 @@ ${result.content}
           )}
           <div className="compact-list">
             {workflowData.reports.slice(1, 8).map((report) => (
-              <button key={report.id} onClick={() => openFloatingReport(report.id)}>
-                {report.title}
-              </button>
+              <div className="compact-report" key={report.id}>
+                <button onClick={() => openFloatingReport(report.id)}>{report.title}</button>
+                <button onClick={() => deleteReport(report)}>删除</button>
+              </div>
             ))}
           </div>
         </div>
@@ -2428,8 +2569,8 @@ ${result.content}
             ) : (
               workflowData.activities.map((activity) => (
                 <div key={activity.id} className="activity-item">
-                  <strong>{activity.text}</strong>
-                  <small>{new Date(activity.createdAt).toLocaleString('zh-CN')}</small>
+                  <span><strong>{activity.text}</strong><small>{new Date(activity.createdAt).toLocaleString('zh-CN')}</small></span>
+                  <button onClick={() => deleteActivity(activity)}>删除</button>
                 </div>
               ))
             )}
@@ -2445,6 +2586,14 @@ ${result.content}
         <button className="panel-action-button" onClick={rememberCurrentGoal}>
           保存当前输入
         </button>
+        <div className="memory-list">
+          {memoryNotes.map((note) => (
+            <div className="memory-item" key={note.id}>
+              <span>{note.text}</span>
+              <button onClick={() => removeMemoryNote(note.id)}>删除</button>
+            </div>
+          ))}
+        </div>
       </div>
     )
   }
@@ -2490,7 +2639,7 @@ ${result.content}
           onClick={() => setLeftPanelCollapsed((currentValue) => !currentValue)}
           title={leftPanelCollapsed ? '展开左侧管家面板' : '折叠左侧管家面板'}
         >
-          {leftPanelCollapsed ? '>' : '<'}
+          {leftPanelCollapsed ? <ChevronRight aria-hidden="true" size={16} /> : <ChevronLeft aria-hidden="true" size={16} />}
         </button>
         {!leftPanelCollapsed && (
           <AvatarPanel
@@ -2531,25 +2680,30 @@ ${result.content}
               </button>
             </div>
             <button className="settings-button" onClick={() => setSettingsOpen(true)}>
-              设置
+              <Settings aria-hidden="true" size={17} />
+              <span>设置</span>
             </button>
           </div>
         </header>
 
         <section className="quick-start">
           <button onClick={() => startButlerScenario('file')} disabled={isThinking || !isElectronReady}>
+            <FileText aria-hidden="true" size={18} />
             <strong>文件变行动</strong>
             <span>分析资料，生成报告、计划和今日任务</span>
           </button>
           <button onClick={() => startButlerScenario('trip')}>
+            <Plane aria-hidden="true" size={18} />
             <strong>出差规划</strong>
             <span>交通、天气、酒店、预算和报销清单</span>
           </button>
           <button onClick={() => startButlerScenario('expense')}>
+            <ReceiptText aria-hidden="true" size={18} />
             <strong>报销整理</strong>
             <span>找异常、缺票、超预算并持续跟踪</span>
           </button>
           <button onClick={() => startButlerScenario(mode === 'user' ? 'today' : 'workReport')}>
+            <ListChecks aria-hidden="true" size={18} />
             <strong>{mode === 'user' ? '今日任务' : '工作汇报'}</strong>
             <span>{mode === 'user' ? '提醒、进度复盘和停滞拆解' : '根据记录生成汇报'}</span>
           </button>
@@ -2583,7 +2737,7 @@ ${result.content}
           onClick={() => setRightPanelCollapsed((currentValue) => !currentValue)}
           title={rightPanelCollapsed ? '展开右侧工作台' : '折叠右侧工作台'}
         >
-          {rightPanelCollapsed ? '<' : '>'}
+          {rightPanelCollapsed ? <ChevronLeft aria-hidden="true" size={16} /> : <ChevronRight aria-hidden="true" size={16} />}
         </button>
         {!rightPanelCollapsed && (
           <>
@@ -2594,7 +2748,7 @@ ${result.content}
           <ul>
             <li>桌面连接：{isElectronReady ? '已连接' : '未连接'}</li>
             <li>当前模型：{activeProvider?.name ?? '加载中'}</li>
-            <li>资料库：{knowledgeDocuments.length} 份文件</li>
+            <li>资料库：{knowledgeIndex.length} 份文件</li>
             <li>计划：{activePlans.length} 个进行中 / {finishedPlans.length} 个完成</li>
           </ul>
         </div>

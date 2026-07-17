@@ -4,6 +4,8 @@ import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
+import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -97,6 +99,21 @@ type StoredAgentRun = {
   error?: string
 }
 
+type KnowledgeDocumentInput = {
+  id: string | number
+  name: string
+  content: string
+  createdAt: number
+}
+
+type KnowledgeSearchResult = {
+  documentId: string
+  documentName: string
+  chunkIndex: number
+  content: string
+  score: number
+}
+
 type AgentPlatformConfig = {
   activeProviderId: string
   providers: ModelProviderConfig[]
@@ -107,6 +124,7 @@ type AgentPlatformConfig = {
 let mainWindow: BrowserWindow | null = null
 let floatingReportWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let database: DatabaseSync | null = null
 
 function readLocalEnv() {
   const envPath = path.join(appRoot, '.env.local')
@@ -383,16 +401,28 @@ function getConfigPath() {
   return path.join(app.getPath('userData'), 'agent-platform-config.json')
 }
 
-function getWorkspaceDataPath() {
+function getLegacyWorkspaceDataPath() {
   return path.join(app.getPath('userData'), 'butler-workspace-data.json')
 }
 
-function getAgentRunsPath() {
+function getLegacyAgentRunsPath() {
   return path.join(app.getPath('userData'), 'agent-runs.json')
 }
 
-function readAgentRuns(): StoredAgentRun[] {
-  const dataPath = getAgentRunsPath()
+function getDatabasePath() {
+  return path.join(app.getPath('userData'), 'butler-data.sqlite')
+}
+
+function createDefaultWorkspaceData(): ButlerWorkspaceData {
+  return {
+    reports: [],
+    plans: [],
+    activities: [],
+  }
+}
+
+function readLegacyAgentRuns(): StoredAgentRun[] {
+  const dataPath = getLegacyAgentRunsPath()
   if (!fs.existsSync(dataPath)) return []
 
   try {
@@ -401,6 +431,254 @@ function readAgentRuns(): StoredAgentRun[] {
   } catch {
     return []
   }
+}
+
+function readLegacyWorkspaceData(): ButlerWorkspaceData {
+  const dataPath = getLegacyWorkspaceDataPath()
+
+  if (!fs.existsSync(dataPath)) {
+    return createDefaultWorkspaceData()
+  }
+
+  try {
+    const savedData = JSON.parse(fs.readFileSync(dataPath, 'utf8')) as Partial<ButlerWorkspaceData>
+    return {
+      reports: Array.isArray(savedData.reports) ? savedData.reports : [],
+      plans: Array.isArray(savedData.plans) ? savedData.plans : [],
+      activities: Array.isArray(savedData.activities) ? savedData.activities : [],
+    }
+  } catch {
+    return createDefaultWorkspaceData()
+  }
+}
+
+function initializeDatabase() {
+  if (database) return database
+
+  const databasePath = getDatabasePath()
+  fs.mkdirSync(path.dirname(databasePath), { recursive: true })
+  database = new DatabaseSync(databasePath)
+  database.exec('PRAGMA journal_mode = WAL')
+  database.exec('PRAGMA foreign_keys = ON')
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS plans (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL,
+      checkins INTEGER NOT NULL DEFAULT 0,
+      last_checkin_at INTEGER,
+      reminder_time TEXT,
+      last_reminder_date TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS activities (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_notes (
+      id TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id TEXT PRIMARY KEY,
+      goal TEXT NOT NULL,
+      status TEXT NOT NULL,
+      turns INTEGER NOT NULL,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      observations_json TEXT NOT NULL,
+      final_text TEXT,
+      error_text TEXT
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_documents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      document_id TEXT NOT NULL,
+      document_name TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_activities_created_at ON activities(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_notes_created_at ON memory_notes(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at ON agent_runs(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document_id ON knowledge_chunks(document_id);
+  `)
+  try {
+    database.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+        document_id UNINDEXED,
+        document_name UNINDEXED,
+        chunk_index UNINDEXED,
+        content,
+        tokenize='trigram'
+      );
+    `)
+  } catch {
+    database.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+        document_id UNINDEXED,
+        document_name UNINDEXED,
+        chunk_index UNINDEXED,
+        content,
+        tokenize='unicode61'
+      );
+    `)
+  }
+  migrateLegacyData(database)
+  return database
+}
+
+function isMigrationComplete(db: DatabaseSync, key: string) {
+  return Boolean(db.prepare('SELECT value FROM metadata WHERE key = ?').get(key))
+}
+
+function markMigrationComplete(db: DatabaseSync, key: string) {
+  db.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)').run(key, new Date().toISOString())
+}
+
+function replaceWorkspaceData(db: DatabaseSync, data: ButlerWorkspaceData) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.exec('DELETE FROM reports; DELETE FROM plans; DELETE FROM activities;')
+    const insertReport = db.prepare(
+      'INSERT INTO reports (id, title, summary, content, source, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    const insertPlan = db.prepare(
+      'INSERT INTO plans (id, title, description, status, checkins, last_checkin_at, reminder_time, last_reminder_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    const insertActivity = db.prepare(
+      'INSERT INTO activities (id, type, text, created_at) VALUES (?, ?, ?, ?)',
+    )
+
+    for (const report of data.reports) {
+      insertReport.run(report.id, report.title, report.summary, report.content, report.source, report.createdAt)
+    }
+    for (const plan of data.plans) {
+      insertPlan.run(
+        plan.id,
+        plan.title,
+        plan.description,
+        plan.status,
+        plan.checkins,
+        plan.lastCheckinAt ?? null,
+        plan.reminderTime ?? null,
+        plan.lastReminderDate ?? null,
+        plan.createdAt,
+        plan.updatedAt,
+      )
+    }
+    for (const activity of data.activities) {
+      insertActivity.run(activity.id, activity.type, activity.text, activity.createdAt)
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function insertAgentRun(db: DatabaseSync, run: StoredAgentRun) {
+  db.prepare(
+    `INSERT OR REPLACE INTO agent_runs
+      (id, goal, status, turns, started_at, finished_at, observations_json, final_text, error_text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    run.id,
+    run.goal,
+    run.status,
+    run.turns,
+    run.startedAt,
+    run.finishedAt ?? null,
+    JSON.stringify(run.observations),
+    run.final ?? null,
+    run.error ?? null,
+  )
+}
+
+function migrateLegacyData(db: DatabaseSync) {
+  if (!isMigrationComplete(db, 'legacy-workspace-json-v1')) {
+    replaceWorkspaceData(db, readLegacyWorkspaceData())
+    markMigrationComplete(db, 'legacy-workspace-json-v1')
+  }
+
+  if (!isMigrationComplete(db, 'legacy-agent-runs-json-v1')) {
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const run of readLegacyAgentRuns()) insertAgentRun(db, run)
+      markMigrationComplete(db, 'legacy-agent-runs-json-v1')
+      db.exec('COMMIT')
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+}
+
+function readAgentRuns(): StoredAgentRun[] {
+  const rows = initializeDatabase()
+    .prepare(
+      `SELECT id, goal, status, turns, started_at AS startedAt, finished_at AS finishedAt,
+        observations_json AS observationsJson, final_text AS finalText, error_text AS errorText
+      FROM agent_runs ORDER BY started_at DESC LIMIT 100`,
+    )
+    .all() as Array<{
+      id: string
+      goal: string
+      status: StoredAgentRun['status']
+      turns: number
+      startedAt: number
+      finishedAt: number | null
+      observationsJson: string
+      finalText: string | null
+      errorText: string | null
+    }>
+
+  return rows.map((row) => {
+    let observations: unknown[] = []
+    try {
+      const parsed = JSON.parse(row.observationsJson)
+      observations = Array.isArray(parsed) ? parsed : []
+    } catch {
+      observations = []
+    }
+    return {
+      id: row.id,
+      goal: row.goal,
+      status: row.status,
+      turns: row.turns,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt ?? undefined,
+      observations,
+      final: row.finalText ?? undefined,
+      error: row.errorText ?? undefined,
+    }
+  })
 }
 
 function saveAgentRun(value: unknown) {
@@ -422,49 +700,220 @@ function saveAgentRun(value: unknown) {
     final: typeof run.final === 'string' ? run.final.slice(0, 12000) : undefined,
     error: typeof run.error === 'string' ? run.error.slice(0, 2000) : undefined,
   }
-  const nextRuns = [savedRun, ...readAgentRuns().filter((item) => item.id !== savedRun.id)].slice(0, 100)
-  const dataPath = getAgentRunsPath()
-  fs.mkdirSync(path.dirname(dataPath), { recursive: true })
-  fs.writeFileSync(dataPath, `${JSON.stringify(nextRuns, null, 2)}\n`, 'utf8')
+  const db = initializeDatabase()
+  insertAgentRun(db, savedRun)
+  db.exec(
+    'DELETE FROM agent_runs WHERE id NOT IN (SELECT id FROM agent_runs ORDER BY started_at DESC LIMIT 100)',
+  )
   return savedRun
 }
 
-function createDefaultWorkspaceData(): ButlerWorkspaceData {
-  return {
-    reports: [],
-    plans: [],
-    activities: [],
-  }
-}
-
 function readWorkspaceData(): ButlerWorkspaceData {
-  const dataPath = getWorkspaceDataPath()
+  const db = initializeDatabase()
+  const reports = db
+    .prepare(
+      'SELECT id, title, summary, content, source, created_at AS createdAt FROM reports ORDER BY created_at DESC',
+    )
+    .all() as ButlerReport[]
+  const planRows = db
+    .prepare(
+      `SELECT id, title, description, status, checkins, last_checkin_at AS lastCheckinAt,
+        reminder_time AS reminderTime, last_reminder_date AS lastReminderDate,
+        created_at AS createdAt, updated_at AS updatedAt
+      FROM plans ORDER BY updated_at DESC`,
+    )
+    .all() as Array<ButlerPlan & {
+      lastCheckinAt: number | null
+      reminderTime: string | null
+      lastReminderDate: string | null
+    }>
+  const activities = db
+    .prepare('SELECT id, type, text, created_at AS createdAt FROM activities ORDER BY created_at DESC')
+    .all() as ButlerActivity[]
 
-  if (!fs.existsSync(dataPath)) {
-    return createDefaultWorkspaceData()
-  }
-
-  try {
-    const savedData = JSON.parse(fs.readFileSync(dataPath, 'utf8')) as Partial<ButlerWorkspaceData>
-    return {
-      reports: Array.isArray(savedData.reports) ? savedData.reports : [],
-      plans: Array.isArray(savedData.plans) ? savedData.plans : [],
-      activities: Array.isArray(savedData.activities) ? savedData.activities : [],
-    }
-  } catch {
-    return createDefaultWorkspaceData()
+  return {
+    reports,
+    plans: planRows.map((plan) => ({
+      ...plan,
+      lastCheckinAt: plan.lastCheckinAt ?? undefined,
+      reminderTime: plan.reminderTime ?? undefined,
+      lastReminderDate: plan.lastReminderDate ?? undefined,
+    })),
+    activities,
   }
 }
 
 function saveWorkspaceData(data: ButlerWorkspaceData) {
-  const dataPath = getWorkspaceDataPath()
-  fs.mkdirSync(path.dirname(dataPath), { recursive: true })
-  fs.writeFileSync(dataPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8')
+  replaceWorkspaceData(initializeDatabase(), data)
   return readWorkspaceData()
+}
+
+function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
+  if (!value || typeof value !== 'object') throw new Error('Invalid knowledge document')
+  const document = value as Partial<KnowledgeDocumentInput>
+  if (
+    (typeof document.id !== 'string' && typeof document.id !== 'number') ||
+    typeof document.name !== 'string' ||
+    typeof document.content !== 'string'
+  ) {
+    throw new Error('Knowledge document is missing required fields')
+  }
+  return {
+    id: document.id,
+    name: document.name.slice(0, 300),
+    content: document.content.slice(0, 1_000_000),
+    createdAt: typeof document.createdAt === 'number' ? document.createdAt : Date.now(),
+  }
+}
+
+function upsertKnowledgeDocument(value: unknown) {
+  const document = normalizeKnowledgeDocument(value)
+  const documentId = String(document.id)
+  const chunks = chunkKnowledgeContent(document.content)
+  const db = initializeDatabase()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare(
+      `INSERT INTO knowledge_documents (id, name, content, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET name = excluded.name, content = excluded.content, updated_at = excluded.updated_at`,
+    ).run(documentId, document.name, document.content, document.createdAt, Date.now())
+    db.prepare('DELETE FROM knowledge_chunks WHERE document_id = ?').run(documentId)
+    db.prepare('DELETE FROM knowledge_chunks_fts WHERE document_id = ?').run(documentId)
+    const insertChunk = db.prepare(
+      'INSERT INTO knowledge_chunks (document_id, document_name, chunk_index, content) VALUES (?, ?, ?, ?)',
+    )
+    const insertSearchChunk = db.prepare(
+      'INSERT INTO knowledge_chunks_fts (document_id, document_name, chunk_index, content) VALUES (?, ?, ?, ?)',
+    )
+    chunks.forEach((chunk, chunkIndex) => {
+      insertChunk.run(documentId, document.name, chunkIndex, chunk)
+      insertSearchChunk.run(documentId, document.name, chunkIndex, chunk)
+    })
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+  return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length }
+}
+
+function syncKnowledgeDocuments(values: unknown) {
+  if (!Array.isArray(values)) return []
+  return values.slice(0, 50).map(upsertKnowledgeDocument)
+}
+
+function listKnowledgeDocuments() {
+  return initializeDatabase()
+    .prepare(
+      `SELECT documents.id, documents.name, documents.created_at AS createdAt,
+        documents.updated_at AS updatedAt, COUNT(chunks.id) AS chunkCount,
+        LENGTH(documents.content) AS characterCount
+      FROM knowledge_documents AS documents
+      LEFT JOIN knowledge_chunks AS chunks ON chunks.document_id = documents.id
+      GROUP BY documents.id
+      ORDER BY documents.updated_at DESC`,
+    )
+    .all()
+}
+
+function deleteKnowledgeDocument(documentId: string) {
+  const safeId = String(documentId).slice(0, 160)
+  const db = initializeDatabase()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare('DELETE FROM knowledge_chunks_fts WHERE document_id = ?').run(safeId)
+    const result = db.prepare('DELETE FROM knowledge_documents WHERE id = ?').run(safeId)
+    db.exec('COMMIT')
+    return { deleted: result.changes > 0, id: safeId }
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function searchKnowledge(query: string, requestedLimit = 6): KnowledgeSearchResult[] {
+  const terms = createKnowledgeSearchTerms(query)
+  if (terms.length === 0) return []
+  const limit = Math.max(1, Math.min(Number(requestedLimit) || 6, 12))
+  const db = initializeDatabase()
+  const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
+
+  try {
+    const rows = db
+      .prepare(
+        `SELECT document_id AS documentId, document_name AS documentName,
+          CAST(chunk_index AS INTEGER) AS chunkIndex, content,
+          bm25(knowledge_chunks_fts) AS rank
+        FROM knowledge_chunks_fts
+        WHERE knowledge_chunks_fts MATCH ?
+        ORDER BY rank ASC LIMIT ?`,
+      )
+      .all(ftsQuery, limit) as Array<KnowledgeSearchResult & { rank: number }>
+    if (rows.length > 0) {
+      return rows.map(({ rank, ...row }) => ({ ...row, score: Number((-rank).toFixed(6)) }))
+    }
+  } catch {
+    // Fall back to LIKE search when a platform FTS tokenizer cannot parse a query.
+  }
+
+  const fallbackTerms = terms.slice(0, 8)
+  const where = fallbackTerms.map(() => 'content LIKE ?').join(' OR ')
+  const rows = db
+    .prepare(
+      `SELECT document_id AS documentId, document_name AS documentName,
+        chunk_index AS chunkIndex, content
+      FROM knowledge_chunks WHERE ${where} LIMIT ?`,
+    )
+    .all(...fallbackTerms.map((term) => `%${term}%`), limit) as Array<Omit<KnowledgeSearchResult, 'score'>>
+  return rows.map((row) => ({ ...row, score: 0 }))
 }
 
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function readMemoryNotes() {
+  return initializeDatabase()
+    .prepare('SELECT id, text, created_at AS createdAt FROM memory_notes ORDER BY created_at DESC LIMIT 100')
+    .all()
+}
+
+function addMemoryNote(text: string) {
+  const normalized = typeof text === 'string' ? text.trim().slice(0, 4000) : ''
+  if (!normalized) throw new Error('Memory note cannot be empty')
+  initializeDatabase()
+    .prepare('INSERT INTO memory_notes (id, text, created_at) VALUES (?, ?, ?)')
+    .run(createId('memory'), normalized, Date.now())
+  return readMemoryNotes()
+}
+
+function syncMemoryNotes(values: unknown) {
+  if (!Array.isArray(values)) return readMemoryNotes()
+  const db = initializeDatabase()
+  const insert = db.prepare('INSERT INTO memory_notes (id, text, created_at) VALUES (?, ?, ?)')
+  const existing = db.prepare('SELECT text FROM memory_notes').all() as Array<{ text: string }>
+  const known = new Set(existing.map((item) => item.text))
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    values.slice(0, 100).forEach((value, index) => {
+      if (typeof value !== 'string') return
+      const text = value.trim().slice(0, 4000)
+      if (!text || known.has(text)) return
+      insert.run(createId('memory'), text, Date.now() - index)
+      known.add(text)
+    })
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+  return readMemoryNotes()
+}
+
+function deleteMemoryNote(noteId: string) {
+  initializeDatabase().prepare('DELETE FROM memory_notes WHERE id = ?').run(String(noteId).slice(0, 160))
+  return readMemoryNotes()
 }
 
 function appendActivity(data: ButlerWorkspaceData, activity: Omit<ButlerActivity, 'id' | 'createdAt'>) {
@@ -1054,6 +1503,42 @@ ipcMain.handle('agent-runs:save', (_event, run: unknown) => {
   return saveAgentRun(run)
 })
 
+ipcMain.handle('knowledge:sync', (_event, documents: unknown) => {
+  return syncKnowledgeDocuments(documents)
+})
+
+ipcMain.handle('knowledge:list', () => {
+  return listKnowledgeDocuments()
+})
+
+ipcMain.handle('knowledge:upsert', (_event, document: unknown) => {
+  return upsertKnowledgeDocument(document)
+})
+
+ipcMain.handle('knowledge:search', (_event, query: string, limit?: number) => {
+  return searchKnowledge(typeof query === 'string' ? query.slice(0, 1000) : '', limit)
+})
+
+ipcMain.handle('knowledge:delete', (_event, documentId: string) => {
+  return deleteKnowledgeDocument(documentId)
+})
+
+ipcMain.handle('memory:list', () => {
+  return readMemoryNotes()
+})
+
+ipcMain.handle('memory:sync', (_event, notes: unknown) => {
+  return syncMemoryNotes(notes)
+})
+
+ipcMain.handle('memory:add', (_event, text: string) => {
+  return addMemoryNote(text)
+})
+
+ipcMain.handle('memory:delete', (_event, noteId: string) => {
+  return deleteMemoryNote(noteId)
+})
+
 ipcMain.handle('workflow:save-report', (_event, report: Omit<ButlerReport, 'id' | 'createdAt'>) => {
   const data = readWorkspaceData()
   const savedReport: ButlerReport = {
@@ -1066,6 +1551,12 @@ ipcMain.handle('workflow:save-report', (_event, report: Omit<ButlerReport, 'id' 
     type: 'report',
     text: `生成报告：${savedReport.title}`,
   })
+  return saveWorkspaceData(data)
+})
+
+ipcMain.handle('workflow:delete-report', (_event, reportId: string) => {
+  const data = readWorkspaceData()
+  data.reports = data.reports.filter((report) => report.id !== String(reportId))
   return saveWorkspaceData(data)
 })
 
@@ -1145,6 +1636,12 @@ ipcMain.handle('workflow:add-activity', (_event, text: string) => {
     type: 'note',
     text,
   })
+  return saveWorkspaceData(data)
+})
+
+ipcMain.handle('workflow:delete-activity', (_event, activityId: string) => {
+  const data = readWorkspaceData()
+  data.activities = data.activities.filter((activity) => activity.id !== String(activityId))
   return saveWorkspaceData(data)
 })
 
@@ -1354,7 +1851,10 @@ app.whenReady().then(() => {
   })
 
   try {
-    tray = new Tray(path.join(appRoot, 'public', 'favicon.svg'))
+    const trayIconPath = app.isPackaged
+      ? path.join(process.resourcesPath, 'icon.png')
+      : path.join(appRoot, 'build', 'icon.png')
+    tray = new Tray(trayIconPath)
     tray.setToolTip(APP_TITLE)
     tray.on('click', () => {
       mainWindow?.show()
@@ -1379,5 +1879,7 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
+  database?.close()
+  database = null
   tray = null
 })

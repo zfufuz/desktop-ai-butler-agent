@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { Message } from '../type'
 
 type MessageListProps = {
@@ -31,7 +33,16 @@ function MessageList({ messages }: MessageListProps) {
     >
       {messages.map((message) => (
         <div key={message.id} className={`message ${message.role}`}>
-          <div className="message-content">{message.content}</div>
+          <div className="message-content">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
+          </div>
           <div className="message-time">{formatMessageTime(message.createdAt)}</div>
         </div>
       ))}
