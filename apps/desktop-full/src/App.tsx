@@ -11,6 +11,10 @@ import {
 import './App.css'
 import AvatarPanel from './components/AvatarPanel'
 import AgentRunsPanel, { type AgentRunSnapshot } from './components/AgentRunsPanel'
+import AuditLogPanel, {
+  type AuditLogEntry,
+  type AuditLogFilters,
+} from './components/AuditLogPanel'
 import ChatInput from './components/ChatInput'
 import KnowledgePanel, {
   type KnowledgeDocumentSummary,
@@ -31,8 +35,8 @@ import type { AssistantStatus, Message } from './type'
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
-type SettingsPage = 'home' | 'provider' | 'skill' | 'tool' | 'installed'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'reports' | 'plans' | 'activity' | 'memory'
+type SettingsPage = 'home' | 'provider' | 'skill' | 'tool' | 'installed' | 'data'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -108,6 +112,12 @@ type ButlerPlan = {
   lastCheckinAt?: number
   reminderTime?: string
   lastReminderDate?: string
+  priority: 'low' | 'medium' | 'high'
+  dueDate?: string
+  recurrence: 'none' | 'daily' | 'weekly'
+  progress: number
+  nextAction?: string
+  completedAt?: number
   createdAt: number
   updatedAt: number
 }
@@ -150,7 +160,11 @@ type BuiltinOverrideMap = Record<string, BuiltinOverride>
 type MemoryNote = {
   id: string
   text: string
+  category: 'preference' | 'goal' | 'context' | 'fact'
+  pinned: boolean
+  expiresAt?: number
   createdAt: number
+  updatedAt: number
 }
 
 function createMessageId() {
@@ -433,11 +447,16 @@ function App() {
   const [knowledgeQuery, setKnowledgeQuery] = useState('')
   const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeSearchResult[]>([])
   const [agentRuns, setAgentRuns] = useState<AgentRunSnapshot[]>([])
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([])
+  const [auditLogsLoading, setAuditLogsLoading] = useState(false)
   const [memoryNotes, setMemoryNotes] = useState<MemoryNote[]>(() =>
     readJsonFromStorage<string[]>('ai-butler:memoryNotes', []).map((text, index) => ({
       id: `legacy-memory-${index}`,
       text,
+      category: 'context',
+      pinned: false,
       createdAt: Date.now() - index,
+      updatedAt: Date.now() - index,
     })),
   )
   const [builtinSkillOverrides, setBuiltinSkillOverrides] = useState<BuiltinOverrideMap>(() =>
@@ -471,6 +490,9 @@ function App() {
   const [planForm, setPlanForm] = useState({
     title: '',
     description: '',
+    priority: 'medium' as ButlerPlan['priority'],
+    dueDate: '',
+    recurrence: 'none' as ButlerPlan['recurrence'],
   })
   const [progressDraft, setProgressDraft] = useState({
     planId: '',
@@ -479,6 +501,11 @@ function App() {
     blocker: '',
   })
   const [activityNote, setActivityNote] = useState('')
+  const [memoryForm, setMemoryForm] = useState({
+    text: '',
+    category: 'context' as MemoryNote['category'],
+    expiresOn: '',
+  })
   const [providerForm, setProviderForm] = useState({
     name: '',
     type: 'openai-compatible' as ProviderType,
@@ -609,6 +636,7 @@ function App() {
     window.electronAPI.getWorkflowData().then(setWorkflowData)
     window.electronAPI.getKnowledgeDocuments().then(setKnowledgeIndex)
     window.electronAPI.getAgentRuns().then(setAgentRuns)
+    window.electronAPI.getAuditLogs({ limit: 100 }).then(setAuditLogs)
     window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
       const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
       const nextNotes = legacyNotes.length > 0
@@ -685,18 +713,30 @@ function App() {
       const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
       const todayKey = getDateKey(now)
       const duePlan = workflowData.plans.find(
-        (plan) =>
-          plan.status === 'active' &&
-          plan.reminderTime &&
-          plan.reminderTime <= currentTime &&
-          plan.lastReminderDate !== todayKey,
+        (plan) => {
+          if (plan.status !== 'active') return false
+          const anchorDate = plan.dueDate ? new Date(`${plan.dueDate}T00:00:00`) : new Date(plan.createdAt)
+          const recurrenceMatches =
+            plan.recurrence === 'daily' ||
+            (plan.recurrence === 'weekly' && anchorDate.getDay() === now.getDay()) ||
+            (plan.recurrence === 'none' && !plan.lastReminderDate)
+          const scheduledReminder = Boolean(
+            plan.reminderTime && plan.reminderTime <= currentTime && recurrenceMatches,
+          )
+          const deadlineReminder = Boolean(plan.dueDate && plan.dueDate <= todayKey)
+          return (scheduledReminder || deadlineReminder) && plan.lastReminderDate !== todayKey
+        },
       )
 
       if (!duePlan) {
         return
       }
 
-      await window.electronAPI.notify('桌面 AI 管家提醒', `该推进计划了：${duePlan.title}`)
+      const isOverdue = Boolean(duePlan.dueDate && duePlan.dueDate < todayKey)
+      await window.electronAPI.notify(
+        isOverdue ? '计划已逾期' : '桌面 AI 管家提醒',
+        `${isOverdue ? '请重新安排或推进' : '该推进计划了'}：${duePlan.title}`,
+      )
       const nextData = await window.electronAPI.updatePlan(duePlan.id, {
         lastReminderDate: todayKey,
       })
@@ -844,9 +884,13 @@ ${recentContext}`,
     const nextData = await window.electronAPI.savePlan({
       title: planForm.title.trim(),
       description: planForm.description.trim() || planForm.title.trim(),
+      priority: planForm.priority,
+      dueDate: planForm.dueDate || undefined,
+      recurrence: planForm.recurrence,
+      progress: 0,
     })
     setWorkflowData(nextData)
-    setPlanForm({ title: '', description: '' })
+    setPlanForm({ title: '', description: '', priority: 'medium', dueDate: '', recurrence: 'none' })
   }
 
   async function updatePlanReminder(plan: ButlerPlan, reminderTime: string) {
@@ -859,6 +903,11 @@ ${recentContext}`,
       lastReminderDate: undefined,
     })
     setWorkflowData(nextData)
+  }
+
+  async function updatePlanDetails(plan: ButlerPlan, patch: Partial<ButlerPlan>) {
+    if (!isElectronReady) return
+    setWorkflowData(await window.electronAPI.updatePlan(plan.id, patch))
   }
 
   async function splitStalePlan(plan: ButlerPlan) {
@@ -927,6 +976,7 @@ ${progressText}`,
       const nextData = await window.electronAPI.checkinPlan(
         plan.id,
         `${progressDraft.completion}%｜${progressDraft.note}${progressDraft.blocker ? `｜问题：${progressDraft.blocker}` : ''}`,
+        Number(progressDraft.completion),
       )
       setWorkflowData(nextData)
       setProgressDraft({ planId: '', note: '', completion: '50', blocker: '' })
@@ -1266,6 +1316,7 @@ ${historyContext}
         context: `${modeHint}${memoryContext}`,
         onTimeline: addTimelineStep,
         requestPermission: requestToolPermission,
+        onRunUpdate: (run) => window.electronAPI.saveAgentRun(run),
         onRunComplete: (run) => window.electronAPI.saveAgentRun(run),
         onAssistantDelta: (delta) => {
           streamedContent += delta
@@ -1635,6 +1686,56 @@ ${fileContext}`,
     setKnowledgeIndex(await window.electronAPI.getKnowledgeDocuments())
   }
 
+  async function loadAuditLogs(filters: AuditLogFilters = {}) {
+    if (!isElectronReady) return
+    setAuditLogsLoading(true)
+    try {
+      setAuditLogs(await window.electronAPI.getAuditLogs(filters))
+    } finally {
+      setAuditLogsLoading(false)
+    }
+  }
+
+  async function openAuditLogs() {
+    setWorkspacePage('logs')
+    await loadAuditLogs({ limit: 300 })
+  }
+
+  async function exportAuditLogs(filters: AuditLogFilters) {
+    if (!isElectronReady) return
+    await window.electronAPI.exportAuditLogs(filters)
+    await loadAuditLogs(filters)
+  }
+
+  async function clearAuditLogs() {
+    if (!isElectronReady || !window.confirm('清理审计日志？\n\n该操作不会删除报告、计划、知识库或 Agent 运行记录。')) return
+    setAuditLogsLoading(true)
+    try {
+      await window.electronAPI.clearAuditLogs()
+      setAuditLogs(await window.electronAPI.getAuditLogs({ limit: 300 }))
+    } finally {
+      setAuditLogsLoading(false)
+    }
+  }
+
+  async function exportUserData() {
+    if (!isElectronReady) return
+    await window.electronAPI.exportUserData()
+    await loadAuditLogs({ limit: 300 })
+  }
+
+  async function clearUserData() {
+    if (!isElectronReady || !window.confirm('清理全部本地工作数据？\n\n将删除报告、计划、行动记录、长期记忆、知识库和 Agent 运行历史。模型与 Tool 配置不会删除。建议先导出备份。')) return
+    await window.electronAPI.clearUserData()
+    setWorkflowData({ reports: [], plans: [], activities: [] })
+    setKnowledgeDocuments([])
+    setKnowledgeIndex([])
+    setKnowledgeResults([])
+    setMemoryNotes([])
+    setAgentRuns([])
+    setAuditLogs(await window.electronAPI.getAuditLogs({ limit: 300 }))
+  }
+
   async function rememberCurrentGoal() {
     const note = input.trim()
     if (!note) return
@@ -1643,7 +1744,7 @@ ${fileContext}`,
       setMemoryNotes(await window.electronAPI.addMemoryNote(note))
     } else {
       setMemoryNotes((currentNotes) => [
-        { id: createLocalId('memory'), text: note, createdAt: Date.now() },
+        { id: createLocalId('memory'), text: note, category: 'context' as const, pinned: false, createdAt: Date.now(), updatedAt: Date.now() },
         ...currentNotes,
       ].slice(0, 8))
     }
@@ -1656,6 +1757,21 @@ ${fileContext}`,
     } else {
       setMemoryNotes((notes) => notes.filter((note) => note.id !== noteId))
     }
+  }
+
+  async function addMemoryFromForm() {
+    const text = memoryForm.text.trim()
+    if (!isElectronReady || !text) return
+    const expiresAt = memoryForm.expiresOn
+      ? new Date(`${memoryForm.expiresOn}T23:59:59`).getTime()
+      : undefined
+    setMemoryNotes(await window.electronAPI.addMemoryNote(text, memoryForm.category, expiresAt))
+    setMemoryForm({ text: '', category: 'context', expiresOn: '' })
+  }
+
+  async function updateMemory(note: MemoryNote, patch: Partial<Pick<MemoryNote, 'text' | 'category' | 'pinned' | 'expiresAt'>>) {
+    if (!isElectronReady) return
+    setMemoryNotes(await window.electronAPI.updateMemoryNote(note.id, patch))
   }
 
   async function savePlatformConfig(nextConfig: AgentPlatformConfig) {
@@ -2310,6 +2426,13 @@ ${result.content}
           </span>
           <b>{agentRuns.length} 次</b>
         </button>
+        <button className="settings-entry workspace-entry" onClick={openAuditLogs}>
+          <span>
+            <strong>审计日志</strong>
+            <small>筛选 Agent、工具、文件、配置与系统错误，支持导出诊断。</small>
+          </span>
+          <b>{auditLogs.filter((log) => log.status === 'failure').length > 0 ? `${auditLogs.filter((log) => log.status === 'failure').length} 个异常` : `${auditLogs.length} 条`}</b>
+        </button>
         <button className="settings-entry workspace-entry" onClick={() => startButlerScenario('expense')}>
           <span>
             <strong>报销/支出整理</strong>
@@ -2401,6 +2524,18 @@ ${result.content}
       return <AgentRunsPanel runs={agentRuns} />
     }
 
+    if (workspacePage === 'logs') {
+      return (
+        <AuditLogPanel
+          logs={auditLogs}
+          loading={auditLogsLoading}
+          onLoad={loadAuditLogs}
+          onExport={exportAuditLogs}
+          onClear={clearAuditLogs}
+        />
+      )
+    }
+
     if (workspacePage === 'reports') {
       return (
         <div className="insight-section">
@@ -2466,6 +2601,28 @@ ${result.content}
               placeholder="计划说明，可选"
               onChange={(event) => setPlanForm({ ...planForm, description: event.target.value })}
             />
+            <div className="plan-form-grid">
+              <label>
+                优先级
+                <select value={planForm.priority} onChange={(event) => setPlanForm({ ...planForm, priority: event.target.value as ButlerPlan['priority'] })}>
+                  <option value="high">高</option>
+                  <option value="medium">中</option>
+                  <option value="low">低</option>
+                </select>
+              </label>
+              <label>
+                截止日期
+                <input type="date" value={planForm.dueDate} onChange={(event) => setPlanForm({ ...planForm, dueDate: event.target.value })} />
+              </label>
+              <label>
+                重复
+                <select value={planForm.recurrence} onChange={(event) => setPlanForm({ ...planForm, recurrence: event.target.value as ButlerPlan['recurrence'] })}>
+                  <option value="none">不重复</option>
+                  <option value="daily">每天</option>
+                  <option value="weekly">每周</option>
+                </select>
+              </label>
+            </div>
             <button onClick={addPlanFromForm} disabled={!isElectronReady || !planForm.title.trim()}>
               添加计划
             </button>
@@ -2476,11 +2633,16 @@ ${result.content}
             ) : (
               workflowData.plans.map((plan) => (
                 <div key={plan.id} className={`plan-item ${plan.status}`}>
-                  <strong>{plan.title}</strong>
+                  <div className="plan-title-row">
+                    <strong>{plan.title}</strong>
+                    <span className={`priority-badge ${plan.priority}`}>{plan.priority === 'high' ? '高优先级' : plan.priority === 'low' ? '低优先级' : '中优先级'}</span>
+                  </div>
                   <small>
-                    记录 {plan.checkins} 次 · 最近 {formatShortTime(plan.lastCheckinAt)}
+                    完成度 {plan.progress}% · 记录 {plan.checkins} 次 · 最近 {formatShortTime(plan.lastCheckinAt)}
                     {plan.reminderTime ? ` · 每天 ${plan.reminderTime} 提醒` : ''}
+                    {plan.dueDate ? ` · 截止 ${plan.dueDate}` : ''}
                   </small>
+                  <div className="plan-progress" aria-label={`完成度 ${plan.progress}%`}><span style={{ width: `${plan.progress}%` }} /></div>
                   {isPlanStale(plan) && <div className="stale-badge">停滞 {getDaysSince(plan.lastCheckinAt ?? plan.createdAt)} 天，建议拆小任务</div>}
                   <p>{plan.description}</p>
                   <label className="reminder-row">
@@ -2489,6 +2651,32 @@ ${result.content}
                       type="time"
                       value={plan.reminderTime ?? ''}
                       onChange={(event) => updatePlanReminder(plan, event.target.value)}
+                    />
+                  </label>
+                  <div className="plan-meta-grid">
+                    <label>
+                      优先级
+                      <select value={plan.priority} onChange={(event) => updatePlanDetails(plan, { priority: event.target.value as ButlerPlan['priority'] })}>
+                        <option value="high">高</option><option value="medium">中</option><option value="low">低</option>
+                      </select>
+                    </label>
+                    <label>
+                      截止日期
+                      <input type="date" value={plan.dueDate ?? ''} onChange={(event) => updatePlanDetails(plan, { dueDate: event.target.value || undefined })} />
+                    </label>
+                    <label>
+                      重复
+                      <select value={plan.recurrence} onChange={(event) => updatePlanDetails(plan, { recurrence: event.target.value as ButlerPlan['recurrence'] })}>
+                        <option value="none">不重复</option><option value="daily">每天</option><option value="weekly">每周</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="next-action-row">
+                    下一步
+                    <input
+                      defaultValue={plan.nextAction ?? ''}
+                      placeholder="下一步最小行动"
+                      onBlur={(event) => updatePlanDetails(plan, { nextAction: event.target.value || undefined })}
                     />
                   </label>
                   <div className="plan-actions">
@@ -2582,15 +2770,34 @@ ${result.content}
     return (
       <div className="insight-section">
         <h3>长期记忆</h3>
-        <p>已保存 {memoryNotes.length} 条偏好或目标。输入内容后点击保存。</p>
+        <p>已保存 {memoryNotes.length} 条记忆。可以分类、置顶、编辑和设置有效期。</p>
+        <div className="memory-form">
+          <textarea value={memoryForm.text} placeholder="记录偏好、目标、事实或长期背景" onChange={(event) => setMemoryForm({ ...memoryForm, text: event.target.value })} />
+          <div>
+            <select value={memoryForm.category} onChange={(event) => setMemoryForm({ ...memoryForm, category: event.target.value as MemoryNote['category'] })}>
+              <option value="preference">偏好</option><option value="goal">目标</option><option value="context">背景</option><option value="fact">事实</option>
+            </select>
+            <input type="date" value={memoryForm.expiresOn} title="有效期，可选" onChange={(event) => setMemoryForm({ ...memoryForm, expiresOn: event.target.value })} />
+            <button onClick={addMemoryFromForm} disabled={!isElectronReady || !memoryForm.text.trim()}>添加记忆</button>
+          </div>
+        </div>
         <button className="panel-action-button" onClick={rememberCurrentGoal}>
           保存当前输入
         </button>
         <div className="memory-list">
           {memoryNotes.map((note) => (
             <div className="memory-item" key={note.id}>
-              <span>{note.text}</span>
-              <button onClick={() => removeMemoryNote(note.id)}>删除</button>
+              <div className="memory-content">
+                <textarea defaultValue={note.text} onBlur={(event) => {
+                  const nextText = event.target.value.trim()
+                  if (nextText && nextText !== note.text) void updateMemory(note, { text: nextText })
+                }} />
+                <small>{note.category === 'preference' ? '偏好' : note.category === 'goal' ? '目标' : note.category === 'fact' ? '事实' : '背景'}{note.pinned ? ' · 已置顶' : ''}{note.expiresAt ? ` · 有效至 ${new Date(note.expiresAt).toLocaleDateString('zh-CN')}` : ''}</small>
+              </div>
+              <div className="memory-actions">
+                <button onClick={() => updateMemory(note, { pinned: !note.pinned })}>{note.pinned ? '取消置顶' : '置顶'}</button>
+                <button onClick={() => removeMemoryNote(note.id)}>删除</button>
+              </div>
             </div>
           ))}
         </div>
@@ -2899,6 +3106,13 @@ ${result.content}
                   </span>
                   <b>管理</b>
                 </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('data')}>
+                  <span>
+                    <strong>数据与隐私</strong>
+                    <small>导出本地备份、打开数据目录或清理工作数据。</small>
+                  </span>
+                  <b>本地</b>
+                </button>
                 <button className="settings-entry" onClick={openExtensionsFolder}>
                   <span>
                     <strong>扩展文件夹</strong>
@@ -3061,6 +3275,26 @@ ${result.content}
                     }
                   />
                   <button onClick={addCustomTool}>{editingToolId ? '保存 Tool' : '安装 Tool'}</button>
+                </div>
+              </div>
+            )}
+
+            {settingsPage === 'data' && (
+              <div className="settings-block data-privacy-panel">
+                <h3>数据与隐私</h3>
+                <p className="settings-help">报告、计划、行动、记忆、知识库、Agent 记录和审计日志默认保存在本机。导出的备份不会包含 API Key。</p>
+                <div className="data-stat-grid">
+                  <span><strong>{workflowData.reports.length}</strong><small>报告</small></span>
+                  <span><strong>{workflowData.plans.length}</strong><small>计划</small></span>
+                  <span><strong>{knowledgeIndex.length}</strong><small>资料</small></span>
+                  <span><strong>{memoryNotes.length}</strong><small>记忆</small></span>
+                </div>
+                <button className="panel-action-button" onClick={exportUserData} disabled={!isElectronReady}>导出完整备份</button>
+                <button className="panel-action-button" onClick={() => window.electronAPI.openDataFolder()} disabled={!isElectronReady}>打开本地数据目录</button>
+                <div className="danger-zone">
+                  <strong>危险操作</strong>
+                  <p>清理后无法撤销，模型 Provider、Skill 和 Tool 配置会保留。</p>
+                  <button onClick={clearUserData} disabled={!isElectronReady}>清理全部工作数据</button>
                 </div>
               </div>
             )}

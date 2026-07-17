@@ -36,8 +36,8 @@ function AgentRunsPanel({ runs }: AgentRunsPanelProps) {
             <p>{run.turns} 轮 · {run.observations.length} 次工具观察 · {run.finishedAt ? `${((run.finishedAt - run.startedAt) / 1000).toFixed(1)} 秒` : '尚未结束'}</p>
             {run.error && <p className="run-error">{run.error}</p>}
             {run.observations.map((item, index) => {
-              const observation = item as { toolName?: string; ok?: boolean; summary?: string }
-              return <div className="run-observation" key={index}><strong>{observation.toolName ?? `观察 ${index + 1}`}</strong><small>{observation.ok ? '成功' : '失败'} · {observation.summary}</small></div>
+              const observation = item as { toolName?: string; ok?: boolean; summary?: string; attempts?: number }
+              return <div className="run-observation" key={index}><strong>{observation.toolName ?? `观察 ${index + 1}`}</strong><small>{observation.ok ? '成功' : '失败'} · {observation.summary}{observation.attempts && observation.attempts > 1 ? ` · 尝试 ${observation.attempts} 次` : ''}</small></div>
             })}
           </details>
         ))}

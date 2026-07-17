@@ -78,4 +78,53 @@ describe('AgentOrchestrator', () => {
     expect(run.status).toBe('blocked')
     expect(run.observations).toHaveLength(0)
   })
+
+  it('blocks calls whose parameter types do not match the schema', async () => {
+    const execute = vi.fn()
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide: vi.fn().mockResolvedValue({
+        calls: [{ id: 'invalid-type', name: 'searchKnowledge', input: { query: 42 } }],
+      }),
+      execute,
+      synthesize: vi.fn().mockResolvedValue('参数类型错误。'),
+    }).run('检索')
+
+    expect(execute).not.toHaveBeenCalled()
+    expect(run.status).toBe('blocked')
+  })
+
+  it('retries a low-risk tool once after an execution exception', async () => {
+    const execute = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({ ok: true, summary: '重试成功', content: '结果' })
+    const decide = vi.fn()
+      .mockResolvedValueOnce({ calls: [{ id: 'retry', name: 'searchKnowledge', input: { query: '计划' } }] })
+      .mockResolvedValueOnce({ calls: [], final: 'done' })
+
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide,
+      execute,
+      synthesize: vi.fn().mockResolvedValue('已完成。'),
+    }).run('检索计划')
+
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(run.observations[0]).toMatchObject({ ok: true, attempts: 2 })
+  })
+
+  it('persists running and completed checkpoints', async () => {
+    const checkpoints: string[] = []
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide: vi.fn().mockResolvedValue({ calls: [], final: 'done' }),
+      execute: vi.fn(),
+      synthesize: vi.fn().mockResolvedValue('完成'),
+      onCheckpoint: (snapshot) => checkpoints.push(snapshot.status),
+    }).run('检查状态')
+
+    expect(run.status).toBe('completed')
+    expect(checkpoints[0]).toBe('running')
+    expect(checkpoints.at(-1)).toBe('completed')
+  })
 })

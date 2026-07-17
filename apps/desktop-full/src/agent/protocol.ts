@@ -37,6 +37,7 @@ export type AgentObservation = {
   content: string
   startedAt: number
   finishedAt: number
+  attempts?: number
 }
 
 export type AgentDecision = {
@@ -65,4 +66,3 @@ export type AgentRuntimeEvent =
   | { type: 'tool-start'; turn: number; call: AgentToolCall }
   | { type: 'tool-finish'; turn: number; observation: AgentObservation }
   | { type: 'complete'; turn: number; detail: string }
-

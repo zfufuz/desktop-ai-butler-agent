@@ -20,6 +20,7 @@ type AgentOrchestratorOptions = {
   execute: (call: AgentToolCall) => Promise<Omit<AgentObservation, 'callId' | 'toolName' | 'startedAt' | 'finishedAt'>>
   synthesize: (context: DecisionContext) => Promise<string>
   onEvent?: (event: AgentRuntimeEvent) => void
+  onCheckpoint?: (run: AgentRun) => Promise<unknown> | unknown
   maxTurns?: number
 }
 
@@ -28,7 +29,8 @@ function createRunId() {
 }
 
 function callFingerprint(call: AgentToolCall) {
-  return `${call.name}:${JSON.stringify(call.input)}`
+  const sortedInput = Object.fromEntries(Object.entries(call.input).sort(([left], [right]) => left.localeCompare(right)))
+  return `${call.name}:${JSON.stringify(sortedInput)}`
 }
 
 function validateCall(call: AgentToolCall, tools: AgentToolDefinition[]) {
@@ -38,6 +40,15 @@ function validateCall(call: AgentToolCall, tools: AgentToolDefinition[]) {
   const input = call.input ?? {}
   const allowedKeys = new Set(Object.keys(tool.inputSchema.properties))
   if (Object.keys(input).some((key) => !allowedKeys.has(key))) return false
+
+  const hasValidTypes = Object.entries(input).every(([key, value]) => {
+    const schema = tool.inputSchema.properties[key]
+    if (!schema) return false
+    if (schema.type === 'number') return typeof value === 'number' && Number.isFinite(value)
+    if (schema.type === 'boolean') return typeof value === 'boolean'
+    return typeof value === 'string'
+  })
+  if (!hasValidTypes) return false
 
   return (tool.inputSchema.required ?? []).every((key) => {
     const value = input[key]
@@ -52,6 +63,17 @@ export class AgentOrchestrator {
     this.options = options
   }
 
+  private async checkpoint(run: AgentRun) {
+    try {
+      await this.options.onCheckpoint?.({
+        ...run,
+        observations: [...run.observations],
+      })
+    } catch {
+      // Persistence must never prevent the Agent from completing the user's task.
+    }
+  }
+
   async run(goal: string): Promise<AgentRun> {
     const startedAt = Date.now()
     const run: AgentRun = {
@@ -64,10 +86,12 @@ export class AgentOrchestrator {
     }
     const executedCalls = new Set<string>()
     const maxTurns = Math.max(1, Math.min(this.options.maxTurns ?? 4, 8))
+    await this.checkpoint(run)
 
     try {
       for (let turn = 1; turn <= maxTurns; turn += 1) {
         run.turns = turn
+        await this.checkpoint(run)
         const context: DecisionContext = {
           goal,
           turn,
@@ -92,6 +116,7 @@ export class AgentOrchestrator {
           run.status = 'completed'
           run.final = await this.options.synthesize(context)
           run.finishedAt = Date.now()
+          await this.checkpoint(run)
           this.options.onEvent?.({ type: 'complete', turn, detail: '模型已完成目标' })
           return run
         }
@@ -102,13 +127,22 @@ export class AgentOrchestrator {
           const toolStartedAt = Date.now()
           this.options.onEvent?.({ type: 'tool-start', turn, call })
           let result: Omit<AgentObservation, 'callId' | 'toolName' | 'startedAt' | 'finishedAt'>
-          try {
-            result = await this.options.execute(call)
-          } catch (error) {
-            result = {
-              ok: false,
-              summary: '工具执行异常',
-              content: error instanceof Error ? error.message : String(error),
+          const toolDefinition = this.options.tools.find((tool) => tool.name === call.name)
+          const maximumAttempts = toolDefinition?.riskLevel === 'low' ? 2 : 1
+          let attempts = 0
+          while (true) {
+            attempts += 1
+            try {
+              result = await this.options.execute(call)
+              break
+            } catch (error) {
+              if (attempts < maximumAttempts) continue
+              result = {
+                ok: false,
+                summary: attempts > 1 ? `工具执行异常，重试 ${attempts - 1} 次后失败` : '工具执行异常',
+                content: error instanceof Error ? error.message : String(error),
+              }
+              break
             }
           }
           const observation: AgentObservation = {
@@ -117,8 +151,10 @@ export class AgentOrchestrator {
             toolName: call.name,
             startedAt: toolStartedAt,
             finishedAt: Date.now(),
+            attempts,
           }
           run.observations.push(observation)
+          await this.checkpoint(run)
           this.options.onEvent?.({ type: 'tool-finish', turn, observation })
         }
       }
@@ -131,6 +167,7 @@ export class AgentOrchestrator {
       })
       run.status = run.observations.length > 0 ? 'completed' : 'blocked'
       run.finishedAt = Date.now()
+      await this.checkpoint(run)
       this.options.onEvent?.({
         type: 'complete',
         turn: run.turns,
@@ -141,6 +178,7 @@ export class AgentOrchestrator {
       run.status = 'failed'
       run.error = error instanceof Error ? error.message : String(error)
       run.finishedAt = Date.now()
+      await this.checkpoint(run)
       return run
     }
   }

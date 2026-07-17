@@ -70,6 +70,12 @@ type ButlerPlan = {
   lastCheckinAt?: number
   reminderTime?: string
   lastReminderDate?: string
+  priority: 'low' | 'medium' | 'high'
+  dueDate?: string
+  recurrence: 'none' | 'daily' | 'weekly'
+  progress: number
+  nextAction?: string
+  completedAt?: number
   createdAt: number
   updatedAt: number
 }
@@ -112,6 +118,30 @@ type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+}
+
+type AuditLogLevel = 'info' | 'warn' | 'error'
+type AuditLogStatus = 'success' | 'failure' | 'pending'
+type AuditLogCategory = 'system' | 'agent' | 'tool' | 'file' | 'knowledge' | 'workflow' | 'security'
+
+type AuditLogInput = {
+  level?: AuditLogLevel
+  category: AuditLogCategory
+  action: string
+  summary: string
+  detail?: unknown
+  status?: AuditLogStatus
+  runId?: string
+  durationMs?: number
+  metadata?: Record<string, unknown>
+}
+
+type AuditLogFilters = {
+  level?: AuditLogLevel | 'all'
+  category?: AuditLogCategory | 'all'
+  status?: AuditLogStatus | 'all'
+  query?: string
+  limit?: number
 }
 
 type AgentPlatformConfig = {
@@ -413,6 +443,16 @@ function getDatabasePath() {
   return path.join(app.getPath('userData'), 'butler-data.sqlite')
 }
 
+function getApplicationVersion() {
+  if (app.isPackaged) return app.getVersion()
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(path.join(appRoot, 'package.json'), 'utf8')) as { version?: unknown }
+    return typeof packageJson.version === 'string' ? packageJson.version : app.getVersion()
+  } catch {
+    return app.getVersion()
+  }
+}
+
 function createDefaultWorkspaceData(): ButlerWorkspaceData {
   return {
     reports: [],
@@ -482,6 +522,12 @@ function initializeDatabase() {
       last_checkin_at INTEGER,
       reminder_time TEXT,
       last_reminder_date TEXT,
+      priority TEXT NOT NULL DEFAULT 'medium',
+      due_date TEXT,
+      recurrence TEXT NOT NULL DEFAULT 'none',
+      progress INTEGER NOT NULL DEFAULT 0,
+      next_action TEXT,
+      completed_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -494,7 +540,11 @@ function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS memory_notes (
       id TEXT PRIMARY KEY,
       text TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      category TEXT NOT NULL DEFAULT 'context',
+      pinned INTEGER NOT NULL DEFAULT 0,
+      expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS agent_runs (
       id TEXT PRIMARY KEY,
@@ -506,6 +556,19 @@ function initializeDatabase() {
       observations_json TEXT NOT NULL,
       final_text TEXT,
       error_text TEXT
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      level TEXT NOT NULL,
+      category TEXT NOT NULL,
+      action TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      detail TEXT,
+      status TEXT NOT NULL,
+      run_id TEXT,
+      duration_ms INTEGER,
+      metadata_json TEXT NOT NULL DEFAULT '{}'
     );
     CREATE TABLE IF NOT EXISTS knowledge_documents (
       id TEXT PRIMARY KEY,
@@ -527,8 +590,38 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_activities_created_at ON activities(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_memory_notes_created_at ON memory_notes(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at ON agent_runs(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_category ON audit_logs(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_status ON audit_logs(status, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document_id ON knowledge_chunks(document_id);
   `)
+  const planColumns = new Set(
+    (database.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>).map((column) => column.name),
+  )
+  const planMigrations = [
+    ['priority', "ALTER TABLE plans ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"],
+    ['due_date', 'ALTER TABLE plans ADD COLUMN due_date TEXT'],
+    ['recurrence', "ALTER TABLE plans ADD COLUMN recurrence TEXT NOT NULL DEFAULT 'none'"],
+    ['progress', 'ALTER TABLE plans ADD COLUMN progress INTEGER NOT NULL DEFAULT 0'],
+    ['next_action', 'ALTER TABLE plans ADD COLUMN next_action TEXT'],
+    ['completed_at', 'ALTER TABLE plans ADD COLUMN completed_at INTEGER'],
+  ] as const
+  for (const [column, migration] of planMigrations) {
+    if (!planColumns.has(column)) database.exec(migration)
+  }
+  const memoryColumns = new Set(
+    (database.prepare('PRAGMA table_info(memory_notes)').all() as Array<{ name: string }>).map((column) => column.name),
+  )
+  const memoryMigrations = [
+    ['category', "ALTER TABLE memory_notes ADD COLUMN category TEXT NOT NULL DEFAULT 'context'"],
+    ['pinned', 'ALTER TABLE memory_notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0'],
+    ['expires_at', 'ALTER TABLE memory_notes ADD COLUMN expires_at INTEGER'],
+    ['updated_at', 'ALTER TABLE memory_notes ADD COLUMN updated_at INTEGER'],
+  ] as const
+  for (const [column, migration] of memoryMigrations) {
+    if (!memoryColumns.has(column)) database.exec(migration)
+  }
+  database.prepare('UPDATE memory_notes SET updated_at = created_at WHERE updated_at IS NULL').run()
   try {
     database.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
@@ -551,6 +644,26 @@ function initializeDatabase() {
     `)
   }
   migrateLegacyData(database)
+  const interruptedRuns = database
+    .prepare(
+      `UPDATE agent_runs
+       SET status = 'blocked', finished_at = ?, error_text = COALESCE(error_text, '应用上次退出时任务仍在运行，请重新执行。')
+       WHERE status = 'running'`,
+    )
+    .run(Date.now())
+  if (interruptedRuns.changes > 0) {
+    writeAuditLog({
+      level: 'warn',
+      category: 'agent',
+      action: 'agent.run.recover',
+      summary: `发现 ${interruptedRuns.changes} 个中断任务，已标记为受阻`,
+      metadata: { recovered: interruptedRuns.changes },
+    })
+  }
+  const expiredMemories = database.prepare('DELETE FROM memory_notes WHERE expires_at IS NOT NULL AND expires_at <= ?').run(Date.now())
+  if (expiredMemories.changes > 0) {
+    writeAuditLog({ category: 'workflow', action: 'memory.expire', summary: `已清理 ${expiredMemories.changes} 条过期记忆`, metadata: { deleted: expiredMemories.changes } })
+  }
   return database
 }
 
@@ -570,7 +683,10 @@ function replaceWorkspaceData(db: DatabaseSync, data: ButlerWorkspaceData) {
       'INSERT INTO reports (id, title, summary, content, source, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     )
     const insertPlan = db.prepare(
-      'INSERT INTO plans (id, title, description, status, checkins, last_checkin_at, reminder_time, last_reminder_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO plans
+        (id, title, description, status, checkins, last_checkin_at, reminder_time, last_reminder_date,
+         priority, due_date, recurrence, progress, next_action, completed_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     const insertActivity = db.prepare(
       'INSERT INTO activities (id, type, text, created_at) VALUES (?, ?, ?, ?)',
@@ -589,6 +705,12 @@ function replaceWorkspaceData(db: DatabaseSync, data: ButlerWorkspaceData) {
         plan.lastCheckinAt ?? null,
         plan.reminderTime ?? null,
         plan.lastReminderDate ?? null,
+        plan.priority ?? 'medium',
+        plan.dueDate ?? null,
+        plan.recurrence ?? 'none',
+        Math.max(0, Math.min(plan.progress ?? 0, 100)),
+        plan.nextAction ?? null,
+        plan.completedAt ?? null,
         plan.createdAt,
         plan.updatedAt,
       )
@@ -705,6 +827,17 @@ function saveAgentRun(value: unknown) {
   db.exec(
     'DELETE FROM agent_runs WHERE id NOT IN (SELECT id FROM agent_runs ORDER BY started_at DESC LIMIT 100)',
   )
+  writeAuditLog({
+    level: savedRun.status === 'failed' ? 'error' : savedRun.status === 'blocked' ? 'warn' : 'info',
+    category: 'agent',
+    action: 'agent.run.save',
+    summary: `Agent 任务${savedRun.status === 'completed' ? '完成' : savedRun.status === 'failed' ? '失败' : savedRun.status === 'blocked' ? '受阻' : '运行中'}：${savedRun.goal.slice(0, 120)}`,
+    detail: savedRun.error,
+    status: savedRun.status === 'failed' ? 'failure' : savedRun.status === 'running' ? 'pending' : 'success',
+    runId: savedRun.id,
+    durationMs: savedRun.finishedAt ? savedRun.finishedAt - savedRun.startedAt : undefined,
+    metadata: { turns: savedRun.turns, observations: savedRun.observations.length },
+  })
   return savedRun
 }
 
@@ -719,6 +852,8 @@ function readWorkspaceData(): ButlerWorkspaceData {
     .prepare(
       `SELECT id, title, description, status, checkins, last_checkin_at AS lastCheckinAt,
         reminder_time AS reminderTime, last_reminder_date AS lastReminderDate,
+        priority, due_date AS dueDate, recurrence, progress, next_action AS nextAction,
+        completed_at AS completedAt,
         created_at AS createdAt, updated_at AS updatedAt
       FROM plans ORDER BY updated_at DESC`,
     )
@@ -726,6 +861,9 @@ function readWorkspaceData(): ButlerWorkspaceData {
       lastCheckinAt: number | null
       reminderTime: string | null
       lastReminderDate: string | null
+      dueDate: string | null
+      nextAction: string | null
+      completedAt: number | null
     }>
   const activities = db
     .prepare('SELECT id, type, text, created_at AS createdAt FROM activities ORDER BY created_at DESC')
@@ -738,6 +876,12 @@ function readWorkspaceData(): ButlerWorkspaceData {
       lastCheckinAt: plan.lastCheckinAt ?? undefined,
       reminderTime: plan.reminderTime ?? undefined,
       lastReminderDate: plan.lastReminderDate ?? undefined,
+      priority: ['low', 'medium', 'high'].includes(plan.priority) ? plan.priority : 'medium',
+      dueDate: plan.dueDate ?? undefined,
+      recurrence: ['none', 'daily', 'weekly'].includes(plan.recurrence) ? plan.recurrence : 'none',
+      progress: Math.max(0, Math.min(Number(plan.progress) || 0, 100)),
+      nextAction: plan.nextAction ?? undefined,
+      completedAt: plan.completedAt ?? undefined,
     })),
     activities,
   }
@@ -793,8 +937,10 @@ function upsertKnowledgeDocument(value: unknown) {
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料入库失败：${document.name}`, detail: error, status: 'failure' })
     throw error
   }
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料已入库：${document.name}`, metadata: { documentId, chunks: chunks.length, characters: document.content.length } })
   return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length }
 }
 
@@ -825,9 +971,11 @@ function deleteKnowledgeDocument(documentId: string) {
     db.prepare('DELETE FROM knowledge_chunks_fts WHERE document_id = ?').run(safeId)
     const result = db.prepare('DELETE FROM knowledge_documents WHERE id = ?').run(safeId)
     db.exec('COMMIT')
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.delete', summary: result.changes > 0 ? '已删除资料库文档' : '未找到要删除的资料库文档', status: result.changes > 0 ? 'success' : 'failure', metadata: { documentId: safeId } })
     return { deleted: result.changes > 0, id: safeId }
   } catch (error) {
     db.exec('ROLLBACK')
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.delete', summary: '删除资料库文档失败', detail: error, status: 'failure', metadata: { documentId: safeId } })
     throw error
   }
 }
@@ -873,25 +1021,190 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
-function readMemoryNotes() {
-  return initializeDatabase()
-    .prepare('SELECT id, text, created_at AS createdAt FROM memory_notes ORDER BY created_at DESC LIMIT 100')
-    .all()
+function sanitizeAuditText(value: unknown, maxLength: number) {
+  if (value === undefined || value === null) return undefined
+  return String(value)
+    .replace(/(api[_-]?key|authorization|token|secret)(["'\s:=]+)([^\s,"'}]+)/gi, '$1$2[REDACTED]')
+    .slice(0, maxLength)
 }
 
-function addMemoryNote(text: string) {
+function sanitizeAuditMetadata(metadata?: Record<string, unknown>) {
+  if (!metadata) return {}
+  return Object.fromEntries(
+    Object.entries(metadata)
+      .filter(([key]) => !/(api.?key|authorization|token|secret|content|password)/i.test(key))
+      .slice(0, 20)
+      .map(([key, value]) => [key.slice(0, 80), sanitizeAuditText(value, 500)]),
+  )
+}
+
+function writeAuditLog(input: AuditLogInput) {
+  try {
+    const db = initializeDatabase()
+    db.prepare(
+      `INSERT INTO audit_logs
+        (id, created_at, level, category, action, summary, detail, status, run_id, duration_ms, metadata_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      createId('log'),
+      Date.now(),
+      input.level ?? (input.status === 'failure' ? 'error' : 'info'),
+      input.category,
+      sanitizeAuditText(input.action, 120) ?? 'unknown',
+      sanitizeAuditText(input.summary, 500) ?? '',
+      sanitizeAuditText(input.detail, 4000) ?? null,
+      input.status ?? 'success',
+      sanitizeAuditText(input.runId, 160) ?? null,
+      typeof input.durationMs === 'number' ? Math.max(0, Math.round(input.durationMs)) : null,
+      JSON.stringify(sanitizeAuditMetadata(input.metadata)),
+    )
+    db.exec(
+      'DELETE FROM audit_logs WHERE id NOT IN (SELECT id FROM audit_logs ORDER BY created_at DESC LIMIT 5000)',
+    )
+  } catch (error) {
+    console.error('Failed to persist audit log', error)
+  }
+}
+
+function listAuditLogs(filters: AuditLogFilters = {}) {
+  const clauses: string[] = []
+  const params: Array<string | number> = []
+  const levels = new Set<AuditLogLevel>(['info', 'warn', 'error'])
+  const categories = new Set<AuditLogCategory>(['system', 'agent', 'tool', 'file', 'knowledge', 'workflow', 'security'])
+  const statuses = new Set<AuditLogStatus>(['success', 'failure', 'pending'])
+
+  if (filters.level && levels.has(filters.level as AuditLogLevel)) {
+    clauses.push('level = ?')
+    params.push(filters.level)
+  }
+  if (filters.category && categories.has(filters.category as AuditLogCategory)) {
+    clauses.push('category = ?')
+    params.push(filters.category)
+  }
+  if (filters.status && statuses.has(filters.status as AuditLogStatus)) {
+    clauses.push('status = ?')
+    params.push(filters.status)
+  }
+  const query = typeof filters.query === 'string' ? filters.query.trim().slice(0, 200) : ''
+  if (query) {
+    clauses.push('(summary LIKE ? OR action LIKE ? OR detail LIKE ?)')
+    params.push(`%${query}%`, `%${query}%`, `%${query}%`)
+  }
+  const limit = Math.max(1, Math.min(Number(filters.limit) || 300, 1000))
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''
+  return initializeDatabase()
+    .prepare(
+      `SELECT id, created_at AS createdAt, level, category, action, summary, detail, status,
+        run_id AS runId, duration_ms AS durationMs, metadata_json AS metadataJson
+       FROM audit_logs ${where} ORDER BY created_at DESC LIMIT ?`,
+    )
+    .all(...params, limit)
+    .map((row) => {
+      const item = row as Record<string, unknown>
+      let metadata: Record<string, unknown> = {}
+      try {
+        metadata = JSON.parse(String(item.metadataJson || '{}'))
+      } catch {
+        metadata = {}
+      }
+      const { metadataJson: _metadataJson, ...rest } = item
+      return { ...rest, metadata }
+    })
+}
+
+async function exportAuditLogs(filters: AuditLogFilters = {}) {
+  const logs = listAuditLogs({ ...filters, limit: 1000 }) as Array<Record<string, unknown>>
+  const result = await dialog.showSaveDialog({
+    title: '导出审计日志',
+    defaultPath: `desktop-ai-butler-audit-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  })
+  if (result.canceled || !result.filePath) return { exported: false }
+  fs.writeFileSync(result.filePath, `${JSON.stringify(logs, null, 2)}\n`, 'utf8')
+  writeAuditLog({ category: 'system', action: 'audit.export', summary: `导出 ${logs.length} 条审计日志`, metadata: { count: logs.length } })
+  return { exported: true, path: result.filePath, count: logs.length }
+}
+
+async function exportUserData() {
+  const db = initializeDatabase()
+  const knowledgeDocuments = db
+    .prepare('SELECT id, name, content, created_at AS createdAt, updated_at AS updatedAt FROM knowledge_documents ORDER BY updated_at DESC')
+    .all()
+  const platformConfig = readPlatformConfig()
+  const safeConfig = {
+    ...platformConfig,
+    providers: platformConfig.providers.map(({ apiKey: _apiKey, ...provider }) => provider),
+    customTools: platformConfig.customTools.map(({ apiKey: _apiKey, ...tool }) => tool),
+  }
+  const payload = {
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    appVersion: getApplicationVersion(),
+    workspace: readWorkspaceData(),
+    memoryNotes: readMemoryNotes(),
+    knowledgeDocuments,
+    agentRuns: readAgentRuns(),
+    auditLogs: listAuditLogs({ limit: 1000 }),
+    platformConfig: safeConfig,
+  }
+  const result = await dialog.showSaveDialog({
+    title: '导出桌面 AI 管家数据',
+    defaultPath: `desktop-ai-butler-backup-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  })
+  if (result.canceled || !result.filePath) return { exported: false }
+  fs.writeFileSync(result.filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+  writeAuditLog({ category: 'security', action: 'data.export', summary: '已导出本地数据备份', metadata: { reports: payload.workspace.reports.length, plans: payload.workspace.plans.length, documents: knowledgeDocuments.length } })
+  return { exported: true, path: result.filePath }
+}
+
+function clearUserData() {
+  const db = initializeDatabase()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.exec(`
+      DELETE FROM reports;
+      DELETE FROM plans;
+      DELETE FROM activities;
+      DELETE FROM memory_notes;
+      DELETE FROM agent_runs;
+      DELETE FROM knowledge_chunks_fts;
+      DELETE FROM knowledge_documents;
+    `)
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    writeAuditLog({ category: 'security', action: 'data.clear', summary: '清理本地工作数据失败', detail: error, status: 'failure' })
+    throw error
+  }
+  writeAuditLog({ level: 'warn', category: 'security', action: 'data.clear', summary: '已清理报告、计划、行动、记忆、知识库和 Agent 历史' })
+  return { cleared: true }
+}
+
+function readMemoryNotes() {
+  return initializeDatabase()
+    .prepare(`SELECT id, text, category, pinned, expires_at AS expiresAt, created_at AS createdAt,
+      updated_at AS updatedAt FROM memory_notes
+      WHERE expires_at IS NULL OR expires_at > ? ORDER BY pinned DESC, updated_at DESC LIMIT 100`)
+    .all(Date.now())
+    .map((row) => ({ ...row, pinned: Boolean((row as { pinned: number }).pinned) }))
+}
+
+function addMemoryNote(text: string, category = 'context', expiresAt?: number) {
   const normalized = typeof text === 'string' ? text.trim().slice(0, 4000) : ''
   if (!normalized) throw new Error('Memory note cannot be empty')
+  const safeCategory = ['preference', 'goal', 'context', 'fact'].includes(category) ? category : 'context'
+  const now = Date.now()
   initializeDatabase()
-    .prepare('INSERT INTO memory_notes (id, text, created_at) VALUES (?, ?, ?)')
-    .run(createId('memory'), normalized, Date.now())
+    .prepare('INSERT INTO memory_notes (id, text, category, pinned, expires_at, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)')
+    .run(createId('memory'), normalized, safeCategory, typeof expiresAt === 'number' && expiresAt > now ? expiresAt : null, now, now)
   return readMemoryNotes()
 }
 
 function syncMemoryNotes(values: unknown) {
   if (!Array.isArray(values)) return readMemoryNotes()
   const db = initializeDatabase()
-  const insert = db.prepare('INSERT INTO memory_notes (id, text, created_at) VALUES (?, ?, ?)')
+  const insert = db.prepare('INSERT INTO memory_notes (id, text, category, pinned, expires_at, created_at, updated_at) VALUES (?, ?, ?, 0, NULL, ?, ?)')
   const existing = db.prepare('SELECT text FROM memory_notes').all() as Array<{ text: string }>
   const known = new Set(existing.map((item) => item.text))
   db.exec('BEGIN IMMEDIATE')
@@ -900,7 +1213,8 @@ function syncMemoryNotes(values: unknown) {
       if (typeof value !== 'string') return
       const text = value.trim().slice(0, 4000)
       if (!text || known.has(text)) return
-      insert.run(createId('memory'), text, Date.now() - index)
+      const createdAt = Date.now() - index
+      insert.run(createId('memory'), text, 'context', createdAt, createdAt)
       known.add(text)
     })
     db.exec('COMMIT')
@@ -913,6 +1227,25 @@ function syncMemoryNotes(values: unknown) {
 
 function deleteMemoryNote(noteId: string) {
   initializeDatabase().prepare('DELETE FROM memory_notes WHERE id = ?').run(String(noteId).slice(0, 160))
+  return readMemoryNotes()
+}
+
+function updateMemoryNote(noteId: string, patch: unknown) {
+  if (!patch || typeof patch !== 'object') throw new Error('Invalid memory patch')
+  const current = initializeDatabase()
+    .prepare('SELECT id, text, category, pinned, expires_at AS expiresAt FROM memory_notes WHERE id = ?')
+    .get(String(noteId).slice(0, 160)) as { id: string; text: string; category: string; pinned: number; expiresAt: number | null } | undefined
+  if (!current) throw new Error('Memory note not found')
+  const value = patch as { text?: unknown; category?: unknown; pinned?: unknown; expiresAt?: unknown }
+  const text = typeof value.text === 'string' && value.text.trim() ? value.text.trim().slice(0, 4000) : current.text
+  const category = typeof value.category === 'string' && ['preference', 'goal', 'context', 'fact'].includes(value.category) ? value.category : current.category
+  const pinned = typeof value.pinned === 'boolean' ? Number(value.pinned) : current.pinned
+  const expiresAt = value.expiresAt === null || value.expiresAt === undefined
+    ? null
+    : typeof value.expiresAt === 'number' && value.expiresAt > Date.now() ? value.expiresAt : current.expiresAt
+  initializeDatabase()
+    .prepare('UPDATE memory_notes SET text = ?, category = ?, pinned = ?, expires_at = ?, updated_at = ? WHERE id = ?')
+    .run(text, category, pinned, expiresAt, Date.now(), current.id)
   return readMemoryNotes()
 }
 
@@ -1245,6 +1578,38 @@ function getActiveProvider() {
   return config.providers.find((provider) => provider.id === config.activeProviderId) ?? config.providers[0]
 }
 
+function validateHttpEndpoint(value: string, label: string) {
+  let endpoint: URL
+  try {
+    endpoint = new URL(value)
+  } catch {
+    throw new Error(`${label} URL 无效`)
+  }
+  if (!['http:', 'https:'].includes(endpoint.protocol)) {
+    throw new Error(`${label} 只允许 HTTP 或 HTTPS`)
+  }
+  if (endpoint.username || endpoint.password) {
+    throw new Error(`${label} URL 不能包含用户名或密码`)
+  }
+  return endpoint.toString()
+}
+
+async function readResponseTextLimited(response: Response, maxCharacters = 1_000_000) {
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let content = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    content += decoder.decode(value, { stream: !done })
+    if (content.length > maxCharacters) {
+      await reader.cancel()
+      throw new Error(`响应内容超过 ${maxCharacters} 字符限制`)
+    }
+    if (done) return content
+  }
+}
+
 async function requestChatCompletion(provider: ModelProviderConfig, userText: string) {
   if (provider.type === 'mock') {
     return {
@@ -1258,13 +1623,16 @@ async function requestChatCompletion(provider: ModelProviderConfig, userText: st
     }
   }
 
-  const endpoint =
+  const endpoint = validateHttpEndpoint(
     provider.baseUrl ||
     (provider.type === 'zhipu'
       ? 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
-      : 'https://api.openai.com/v1/chat/completions')
+      : 'https://api.openai.com/v1/chat/completions'),
+    'Provider',
+  )
 
   const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(60_000),
     method: 'POST',
     headers: {
       Authorization: `Bearer ${provider.apiKey}`,
@@ -1307,12 +1675,15 @@ async function requestChatCompletionStream(
     return reply
   }
 
-  const endpoint =
+  const endpoint = validateHttpEndpoint(
     provider.baseUrl ||
     (provider.type === 'zhipu'
       ? 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
-      : 'https://api.openai.com/v1/chat/completions')
+      : 'https://api.openai.com/v1/chat/completions'),
+    'Provider',
+  )
   const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(60_000),
     method: 'POST',
     headers: {
       Authorization: `Bearer ${provider.apiKey}`,
@@ -1358,6 +1729,10 @@ async function requestChatCompletionStream(
         const delta = payload.choices?.[0]?.delta?.content
         if (typeof delta === 'string' && delta.length > 0) {
           content += delta
+          if (content.length > 200_000) {
+            await reader.cancel()
+            throw new Error('模型流式回复超过 200000 字符限制')
+          }
           onDelta(delta)
         }
       } catch {
@@ -1412,15 +1787,16 @@ async function invokeCustomTool(toolId: string, input: string) {
     headers.Authorization = `Bearer ${tool.apiKey}`
   }
 
-  const endpoint = applyToolTemplate(tool.endpoint, input)
+  const endpoint = validateHttpEndpoint(applyToolTemplate(tool.endpoint, input), 'Tool Endpoint')
 
   const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(20_000),
     method: tool.method,
     headers,
     body: tool.method === 'POST' ? JSON.stringify(extractToolVariables(input)) : undefined,
   })
 
-  const text = await response.text()
+  const text = await readResponseTextLimited(response)
 
   if (!response.ok) {
     throw new Error(`Custom tool request failed: ${response.status} ${text.slice(0, 200)}`)
@@ -1459,7 +1835,7 @@ function createMainWindow() {
 }
 
 ipcMain.handle('app:get-version', () => {
-  return app.getVersion()
+  return getApplicationVersion()
 })
 
 ipcMain.handle('system:get-info', () => {
@@ -1471,16 +1847,32 @@ ipcMain.handle('system:get-info', () => {
 })
 
 ipcMain.handle('ai:chat', async (_event, userText: string) => {
-  return createAiReply(userText)
+  const startedAt = Date.now()
+  try {
+    const reply = await createAiReply(userText)
+    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: { inputLength: userText.length, outputLength: reply.content.length } })
+    return reply
+  } catch (error) {
+    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话失败', detail: error, status: 'failure', durationMs: Date.now() - startedAt })
+    throw error
+  }
 })
 
 ipcMain.handle('ai:chat-stream', async (event, requestId: string, userText: string) => {
   const provider = getActiveProvider()
-  return requestChatCompletionStream(provider, userText, (delta) => {
-    if (!event.sender.isDestroyed()) {
-      event.sender.send('ai:chat-stream-delta', requestId, delta)
-    }
-  })
+  const startedAt = Date.now()
+  try {
+    const reply = await requestChatCompletionStream(provider, userText, (delta) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('ai:chat-stream-delta', requestId, delta)
+      }
+    })
+    writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复完成：${provider.name}`, durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model, inputLength: userText.length, outputLength: reply.content.length } })
+    return reply
+  } catch (error) {
+    writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复失败：${provider.name}`, detail: error, status: 'failure', durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model } })
+    throw error
+  }
 })
 
 ipcMain.handle('platform:get-config', () => {
@@ -1488,7 +1880,9 @@ ipcMain.handle('platform:get-config', () => {
 })
 
 ipcMain.handle('platform:save-config', (_event, config: AgentPlatformConfig) => {
-  return savePlatformConfig(config)
+  const saved = savePlatformConfig(config)
+  writeAuditLog({ category: 'security', action: 'config.save', summary: '模型、Skill 与 Tool 配置已保存', metadata: { activeProviderId: saved.activeProviderId, providers: saved.providers.length, skills: saved.customSkills.length, tools: saved.customTools.length } })
+  return saved
 })
 
 ipcMain.handle('workflow:get-data', () => {
@@ -1501,6 +1895,35 @@ ipcMain.handle('agent-runs:list', () => {
 
 ipcMain.handle('agent-runs:save', (_event, run: unknown) => {
   return saveAgentRun(run)
+})
+
+ipcMain.handle('audit:list', (_event, filters: AuditLogFilters) => {
+  return listAuditLogs(filters)
+})
+
+ipcMain.handle('audit:export', (_event, filters: AuditLogFilters) => {
+  return exportAuditLogs(filters)
+})
+
+ipcMain.handle('audit:clear', () => {
+  const result = initializeDatabase().prepare('DELETE FROM audit_logs').run()
+  writeAuditLog({ category: 'security', action: 'audit.clear', summary: `已清理 ${result.changes} 条审计日志`, metadata: { deleted: result.changes } })
+  return { deleted: Number(result.changes) }
+})
+
+ipcMain.handle('data:export', () => {
+  return exportUserData()
+})
+
+ipcMain.handle('data:clear', () => {
+  return clearUserData()
+})
+
+ipcMain.handle('data:open-folder', async () => {
+  const dataPath = app.getPath('userData')
+  await shell.openPath(dataPath)
+  writeAuditLog({ category: 'system', action: 'data.open-folder', summary: '已打开本地数据目录' })
+  return dataPath
 })
 
 ipcMain.handle('knowledge:sync', (_event, documents: unknown) => {
@@ -1516,7 +1939,10 @@ ipcMain.handle('knowledge:upsert', (_event, document: unknown) => {
 })
 
 ipcMain.handle('knowledge:search', (_event, query: string, limit?: number) => {
-  return searchKnowledge(typeof query === 'string' ? query.slice(0, 1000) : '', limit)
+  const safeQuery = typeof query === 'string' ? query.slice(0, 1000) : ''
+  const results = searchKnowledge(safeQuery, limit)
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.search', summary: `资料库检索命中 ${results.length} 个片段`, status: results.length > 0 ? 'success' : 'failure', level: results.length > 0 ? 'info' : 'warn', metadata: { queryLength: safeQuery.length, results: results.length, sources: [...new Set(results.map((item) => item.documentName))].join(', ') } })
+  return results
 })
 
 ipcMain.handle('knowledge:delete', (_event, documentId: string) => {
@@ -1531,12 +1957,22 @@ ipcMain.handle('memory:sync', (_event, notes: unknown) => {
   return syncMemoryNotes(notes)
 })
 
-ipcMain.handle('memory:add', (_event, text: string) => {
-  return addMemoryNote(text)
+ipcMain.handle('memory:add', (_event, text: string, category?: string, expiresAt?: number) => {
+  const notes = addMemoryNote(text, category, expiresAt)
+  writeAuditLog({ category: 'workflow', action: 'memory.add', summary: '已添加长期记忆', metadata: { characters: text.length, category } })
+  return notes
+})
+
+ipcMain.handle('memory:update', (_event, noteId: string, patch: unknown) => {
+  const notes = updateMemoryNote(noteId, patch)
+  writeAuditLog({ category: 'workflow', action: 'memory.update', summary: '已更新长期记忆', metadata: { noteId } })
+  return notes
 })
 
 ipcMain.handle('memory:delete', (_event, noteId: string) => {
-  return deleteMemoryNote(noteId)
+  const notes = deleteMemoryNote(noteId)
+  writeAuditLog({ category: 'workflow', action: 'memory.delete', summary: '已删除长期记忆', metadata: { noteId } })
+  return notes
 })
 
 ipcMain.handle('workflow:save-report', (_event, report: Omit<ButlerReport, 'id' | 'createdAt'>) => {
@@ -1551,13 +1987,17 @@ ipcMain.handle('workflow:save-report', (_event, report: Omit<ButlerReport, 'id' 
     type: 'report',
     text: `生成报告：${savedReport.title}`,
   })
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'report.save', summary: `已生成报告：${savedReport.title}`, metadata: { reportId: savedReport.id, source: savedReport.source } })
+  return saved
 })
 
 ipcMain.handle('workflow:delete-report', (_event, reportId: string) => {
   const data = readWorkspaceData()
   data.reports = data.reports.filter((report) => report.id !== String(reportId))
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'report.delete', summary: '已删除报告', metadata: { reportId } })
+  return saved
 })
 
 ipcMain.handle('workflow:save-plan', (_event, plan: Omit<ButlerPlan, 'id' | 'status' | 'checkins' | 'createdAt' | 'updatedAt'>) => {
@@ -1568,6 +2008,11 @@ ipcMain.handle('workflow:save-plan', (_event, plan: Omit<ButlerPlan, 'id' | 'sta
     description: plan.description,
     status: 'active',
     checkins: 0,
+    priority: ['low', 'medium', 'high'].includes(plan.priority) ? plan.priority : 'medium',
+    dueDate: typeof plan.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(plan.dueDate) ? plan.dueDate : undefined,
+    recurrence: ['none', 'daily', 'weekly'].includes(plan.recurrence) ? plan.recurrence : 'none',
+    progress: 0,
+    nextAction: typeof plan.nextAction === 'string' ? plan.nextAction.slice(0, 1000) : undefined,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }
@@ -1576,16 +2021,33 @@ ipcMain.handle('workflow:save-plan', (_event, plan: Omit<ButlerPlan, 'id' | 'sta
     type: 'plan',
     text: `新增计划：${savedPlan.title}`,
   })
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'plan.create', summary: `已创建计划：${savedPlan.title}`, metadata: { planId: savedPlan.id } })
+  return saved
 })
 
 ipcMain.handle('workflow:update-plan', (_event, planId: string, patch: Partial<ButlerPlan>) => {
   const data = readWorkspaceData()
+  const normalizedPatch: Partial<ButlerPlan> = {}
+  if (typeof patch.title === 'string' && patch.title.trim()) normalizedPatch.title = patch.title.trim().slice(0, 300)
+  if (typeof patch.description === 'string') normalizedPatch.description = patch.description.trim().slice(0, 4000)
+  if (patch.status === 'active' || patch.status === 'done') {
+    normalizedPatch.status = patch.status
+    normalizedPatch.completedAt = patch.status === 'done' ? Date.now() : undefined
+    if (patch.status === 'done') normalizedPatch.progress = 100
+  }
+  if (patch.priority && ['low', 'medium', 'high'].includes(patch.priority)) normalizedPatch.priority = patch.priority
+  if (patch.recurrence && ['none', 'daily', 'weekly'].includes(patch.recurrence)) normalizedPatch.recurrence = patch.recurrence
+  if (patch.dueDate === undefined || (typeof patch.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(patch.dueDate))) normalizedPatch.dueDate = patch.dueDate
+  if (patch.reminderTime === undefined || (typeof patch.reminderTime === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(patch.reminderTime))) normalizedPatch.reminderTime = patch.reminderTime
+  if (patch.lastReminderDate === undefined || typeof patch.lastReminderDate === 'string') normalizedPatch.lastReminderDate = patch.lastReminderDate
+  if (typeof patch.progress === 'number') normalizedPatch.progress = Math.max(0, Math.min(Math.round(patch.progress), 100))
+  if (patch.nextAction === undefined || typeof patch.nextAction === 'string') normalizedPatch.nextAction = patch.nextAction?.trim().slice(0, 1000)
   data.plans = data.plans.map((plan) =>
     plan.id === planId
       ? {
           ...plan,
-          ...patch,
+          ...normalizedPatch,
           id: plan.id,
           createdAt: plan.createdAt,
           updatedAt: Date.now(),
@@ -1596,7 +2058,9 @@ ipcMain.handle('workflow:update-plan', (_event, planId: string, patch: Partial<B
     type: 'plan',
     text: `修改计划：${data.plans.find((plan) => plan.id === planId)?.title ?? planId}`,
   })
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'plan.update', summary: `已更新计划：${saved.plans.find((plan) => plan.id === planId)?.title ?? planId}`, metadata: { planId, fields: Object.keys(normalizedPatch).join(',') } })
+  return saved
 })
 
 ipcMain.handle('workflow:delete-plan', (_event, planId: string) => {
@@ -1607,16 +2071,19 @@ ipcMain.handle('workflow:delete-plan', (_event, planId: string) => {
     type: 'plan',
     text: `删除计划：${targetPlan?.title ?? planId}`,
   })
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'plan.delete', summary: `已删除计划：${targetPlan?.title ?? planId}`, metadata: { planId } })
+  return saved
 })
 
-ipcMain.handle('workflow:checkin-plan', (_event, planId: string, note: string) => {
+ipcMain.handle('workflow:checkin-plan', (_event, planId: string, note: string, progress?: number) => {
   const data = readWorkspaceData()
   data.plans = data.plans.map((plan) =>
     plan.id === planId
       ? {
           ...plan,
           checkins: plan.checkins + 1,
+          progress: typeof progress === 'number' ? Math.max(plan.progress, Math.min(Math.round(progress), 100)) : plan.progress,
           lastCheckinAt: Date.now(),
           updatedAt: Date.now(),
         }
@@ -1627,7 +2094,9 @@ ipcMain.handle('workflow:checkin-plan', (_event, planId: string, note: string) =
     type: 'checkin',
     text: `进度记录：${targetPlan?.title ?? planId}${note ? `｜${note}` : ''}`,
   })
-  return saveWorkspaceData(data)
+  const saved = saveWorkspaceData(data)
+  writeAuditLog({ category: 'workflow', action: 'plan.checkin', summary: `已记录计划进度：${targetPlan?.title ?? planId}`, metadata: { planId, noteLength: note.length } })
+  return saved
 })
 
 ipcMain.handle('workflow:add-activity', (_event, text: string) => {
@@ -1647,6 +2116,7 @@ ipcMain.handle('workflow:delete-activity', (_event, activityId: string) => {
 
 ipcMain.handle('workflow:notify', (_event, title: string, body: string) => {
   if (!Notification.isSupported()) {
+    writeAuditLog({ level: 'warn', category: 'system', action: 'notification.show', summary: '当前系统不支持桌面通知', status: 'failure' })
     return false
   }
 
@@ -1654,6 +2124,7 @@ ipcMain.handle('workflow:notify', (_event, title: string, body: string) => {
     title,
     body,
   }).show()
+  writeAuditLog({ category: 'system', action: 'notification.show', summary: `已发送提醒：${title}`, metadata: { bodyLength: body.length } })
   return true
 })
 
@@ -1679,7 +2150,15 @@ ipcMain.handle('platform:open-extensions-folder', async () => {
 })
 
 ipcMain.handle('tool:invoke-custom', async (_event, toolId: string, input: string) => {
-  return invokeCustomTool(toolId, input)
+  const startedAt = Date.now()
+  try {
+    const result = await invokeCustomTool(toolId, input)
+    writeAuditLog({ category: 'tool', action: 'tool.invoke', summary: `工具调用成功：${result.name}`, durationMs: Date.now() - startedAt, metadata: { toolId, inputLength: input.length } })
+    return result
+  } catch (error) {
+    writeAuditLog({ category: 'tool', action: 'tool.invoke', summary: `工具调用失败：${toolId}`, detail: error, status: 'failure', durationMs: Date.now() - startedAt, metadata: { toolId } })
+    throw error
+  }
 })
 
 ipcMain.handle('file:pick-text', async () => {
@@ -1724,11 +2203,14 @@ ipcMain.handle('file:pick-text', async () => {
   })
 
   if (result.canceled || result.filePaths.length === 0) {
+    writeAuditLog({ level: 'warn', category: 'file', action: 'file.pick', summary: '用户取消选择文件', status: 'failure' })
     return null
   }
 
   const filePath = result.filePaths[0]
-  return readSupportedFile(filePath)
+  const file = readSupportedFile(filePath)
+  writeAuditLog({ category: 'file', action: 'file.read', summary: `已读取文件：${file.name}`, metadata: { extension: path.extname(filePath), bytes: fs.statSync(filePath).size } })
+  return file
 })
 
 ipcMain.handle('file:pick-text-many', async () => {
@@ -1776,7 +2258,10 @@ ipcMain.handle('file:pick-text-many', async () => {
     return []
   }
 
-  return result.filePaths.slice(0, 10).map(readSupportedFile)
+  const paths = result.filePaths.slice(0, 10)
+  const files = paths.map(readSupportedFile)
+  writeAuditLog({ category: 'file', action: 'file.read-many', summary: `已读取 ${files.length} 个文件`, metadata: { files: files.map((file) => file.name).join(', ') } })
+  return files
 })
 
 ipcMain.handle('file:pick-directory-text', async () => {
@@ -1789,21 +2274,26 @@ ipcMain.handle('file:pick-directory-text', async () => {
     return []
   }
 
-  return readDirectoryTextFiles(result.filePaths[0])
+  const files = readDirectoryTextFiles(result.filePaths[0])
+  writeAuditLog({ category: 'file', action: 'directory.read', summary: `已从文件夹读取 ${files.length} 个文件`, metadata: { directory: path.basename(result.filePaths[0]), files: files.map((file) => file.name).join(', ') } })
+  return files
 })
 
 ipcMain.handle('file:read-dropped', async (_event, filePath: string) => {
   if (!filePath || !fs.existsSync(filePath)) {
+    writeAuditLog({ category: 'file', action: 'file.drop', summary: '拖拽文件不存在或路径无效', status: 'failure' })
     return null
   }
 
   const stat = fs.statSync(filePath)
   if (!stat.isFile()) {
+    writeAuditLog({ category: 'file', action: 'file.drop', summary: '拖拽内容不是文件', status: 'failure' })
     return null
   }
 
   const extension = path.extname(filePath).toLowerCase()
   if (!supportedFileExtensions.has(extension)) {
+    writeAuditLog({ level: 'warn', category: 'file', action: 'file.drop', summary: `不支持的文件格式：${extension || '未知'}`, status: 'failure', metadata: { fileName: path.basename(filePath), bytes: stat.size } })
     return {
       name: path.basename(filePath),
       path: filePath,
@@ -1811,17 +2301,22 @@ ipcMain.handle('file:read-dropped', async (_event, filePath: string) => {
     }
   }
 
-  return readSupportedFile(filePath)
+  const file = readSupportedFile(filePath)
+  writeAuditLog({ category: 'file', action: 'file.drop', summary: `已读取拖拽文件：${file.name}`, metadata: { extension, bytes: stat.size } })
+  return file
 })
 
 ipcMain.handle('file:read-named-text', async (_event, query: string) => {
   const filePath = findDesktopTextFile(query)
 
   if (!filePath) {
+    writeAuditLog({ level: 'warn', category: 'file', action: 'file.find-desktop', summary: '桌面未找到匹配文件', status: 'failure', metadata: { queryLength: query.length } })
     return null
   }
 
-  return readSupportedFile(filePath)
+  const file = readSupportedFile(filePath)
+  writeAuditLog({ category: 'file', action: 'file.find-desktop', summary: `已读取桌面文件：${file.name}`, metadata: { extension: path.extname(filePath), bytes: fs.statSync(filePath).size } })
+  return file
 })
 
 ipcMain.handle('window:toggle-always-on-top', () => {
@@ -1831,11 +2326,19 @@ ipcMain.handle('window:toggle-always-on-top', () => {
 
   const nextValue = !mainWindow.isAlwaysOnTop()
   mainWindow.setAlwaysOnTop(nextValue)
+  writeAuditLog({ category: 'system', action: 'window.always-on-top', summary: nextValue ? '已开启窗口置顶' : '已关闭窗口置顶' })
   return nextValue
 })
 
 app.whenReady().then(() => {
+  initializeDatabase()
   migratePlaintextSecrets()
+  writeAuditLog({
+    category: 'system',
+    action: 'app.start',
+    summary: `应用已启动 v${getApplicationVersion()}`,
+    metadata: { platform: process.platform, arch: process.arch, packaged: app.isPackaged },
+  })
   createMainWindow()
   globalShortcut.register('CommandOrControl+Shift+Space', () => {
     if (!mainWindow) {
@@ -1878,8 +2381,19 @@ app.on('window-all-closed', () => {
 })
 
 app.on('will-quit', () => {
+  writeAuditLog({ category: 'system', action: 'app.stop', summary: '应用正常退出' })
   globalShortcut.unregisterAll()
   database?.close()
   database = null
   tray = null
+})
+
+process.on('uncaughtException', (error) => {
+  writeAuditLog({ category: 'system', action: 'process.uncaught-exception', summary: '主进程发生未捕获异常', detail: error.stack ?? error.message, status: 'failure' })
+  console.error(error)
+})
+
+process.on('unhandledRejection', (reason) => {
+  writeAuditLog({ category: 'system', action: 'process.unhandled-rejection', summary: '主进程发生未处理 Promise 拒绝', detail: reason, status: 'failure' })
+  console.error(reason)
 })

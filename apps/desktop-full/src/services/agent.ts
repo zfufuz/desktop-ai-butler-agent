@@ -55,6 +55,7 @@ type AgentOptions = {
   onTimeline: TimelineLogger
   onAssistantDelta?: (delta: string) => void
   onRunComplete?: (run: import('../agent/protocol').AgentRun) => Promise<unknown> | unknown
+  onRunUpdate?: (run: import('../agent/protocol').AgentRun) => Promise<unknown> | unknown
   requestPermission: PermissionRequester
 }
 
@@ -297,6 +298,7 @@ export async function runAgent(
   const orchestrator = new AgentOrchestrator({
     tools,
     maxTurns: 4,
+    onCheckpoint: options.onRunUpdate,
     onEvent: (event) => emitTimeline(event, options.onTimeline),
     decide: async ({ observations }) => {
       const modelDecision = await getModelDecision(userText, observations, tools, logger, options.context)

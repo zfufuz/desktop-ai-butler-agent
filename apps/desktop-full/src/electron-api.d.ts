@@ -79,6 +79,12 @@ type ButlerPlan = {
   lastCheckinAt?: number
   reminderTime?: string
   lastReminderDate?: string
+  priority: 'low' | 'medium' | 'high'
+  dueDate?: string
+  recurrence: 'none' | 'daily' | 'weekly'
+  progress: number
+  nextAction?: string
+  completedAt?: number
   createdAt: number
   updatedAt: number
 }
@@ -108,6 +114,32 @@ type AgentRunSnapshot = {
   error?: string
 }
 
+type AuditLogLevel = 'info' | 'warn' | 'error'
+type AuditLogStatus = 'success' | 'failure' | 'pending'
+type AuditLogCategory = 'system' | 'agent' | 'tool' | 'file' | 'knowledge' | 'workflow' | 'security'
+
+type AuditLogFilters = {
+  level?: AuditLogLevel | 'all'
+  category?: AuditLogCategory | 'all'
+  status?: AuditLogStatus | 'all'
+  query?: string
+  limit?: number
+}
+
+type AuditLogEntry = {
+  id: string
+  createdAt: number
+  level: AuditLogLevel
+  category: AuditLogCategory
+  action: string
+  summary: string
+  detail?: string
+  status: AuditLogStatus
+  runId?: string
+  durationMs?: number
+  metadata: Record<string, unknown>
+}
+
 type KnowledgeDocumentInput = {
   id: string | number
   name: string
@@ -135,7 +167,11 @@ type KnowledgeDocumentSummary = {
 type MemoryNote = {
   id: string
   text: string
+  category: 'preference' | 'goal' | 'context' | 'fact'
+  pinned: boolean
+  expiresAt?: number
   createdAt: number
+  updatedAt: number
 }
 
 declare global {
@@ -162,6 +198,12 @@ declare global {
       getWorkflowData: () => Promise<ButlerWorkspaceData>
       getAgentRuns: () => Promise<AgentRunSnapshot[]>
       saveAgentRun: (run: AgentRunSnapshot) => Promise<AgentRunSnapshot>
+      getAuditLogs: (filters?: AuditLogFilters) => Promise<AuditLogEntry[]>
+      exportAuditLogs: (filters?: AuditLogFilters) => Promise<{ exported: boolean; path?: string; count?: number }>
+      clearAuditLogs: () => Promise<{ deleted: number }>
+      exportUserData: () => Promise<{ exported: boolean; path?: string }>
+      clearUserData: () => Promise<{ cleared: boolean }>
+      openDataFolder: () => Promise<string>
       syncKnowledgeDocuments: (
         documents: KnowledgeDocumentInput[],
       ) => Promise<Array<{ id: string; name: string; createdAt: number; chunkCount: number }>>
@@ -173,16 +215,17 @@ declare global {
       deleteKnowledgeDocument: (documentId: string) => Promise<{ deleted: boolean; id: string }>
       getMemoryNotes: () => Promise<MemoryNote[]>
       syncMemoryNotes: (notes: string[]) => Promise<MemoryNote[]>
-      addMemoryNote: (text: string) => Promise<MemoryNote[]>
+      addMemoryNote: (text: string, category?: MemoryNote['category'], expiresAt?: number) => Promise<MemoryNote[]>
+      updateMemoryNote: (noteId: string, patch: Partial<Pick<MemoryNote, 'text' | 'category' | 'pinned' | 'expiresAt'>>) => Promise<MemoryNote[]>
       deleteMemoryNote: (noteId: string) => Promise<MemoryNote[]>
       saveReport: (report: Omit<ButlerReport, 'id' | 'createdAt'>) => Promise<ButlerWorkspaceData>
       deleteReport: (reportId: string) => Promise<ButlerWorkspaceData>
       savePlan: (
-        plan: Omit<ButlerPlan, 'id' | 'status' | 'checkins' | 'createdAt' | 'updatedAt'>,
+        plan: Pick<ButlerPlan, 'title' | 'description'> & Partial<Pick<ButlerPlan, 'priority' | 'dueDate' | 'recurrence' | 'progress' | 'nextAction' | 'reminderTime'>>,
       ) => Promise<ButlerWorkspaceData>
       updatePlan: (planId: string, patch: Partial<ButlerPlan>) => Promise<ButlerWorkspaceData>
       deletePlan: (planId: string) => Promise<ButlerWorkspaceData>
-      checkinPlan: (planId: string, note: string) => Promise<ButlerWorkspaceData>
+      checkinPlan: (planId: string, note: string, progress?: number) => Promise<ButlerWorkspaceData>
       addActivity: (text: string) => Promise<ButlerWorkspaceData>
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>
       notify: (title: string, body: string) => Promise<boolean>
