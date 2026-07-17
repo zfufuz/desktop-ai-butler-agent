@@ -1,0 +1,46 @@
+{
+  "name": "desktop-ai-butler",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Personal desktop AI butler built with Electron, React, TypeScript, configurable model providers, skills, tools and local RAG.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "electron": "electron dist-electron/main.js",
+    "electron:dev": "wait-on http://localhost:5173 && npm run build:electron && npm run electron",
+    "dev:electron": "concurrently -k \"npm run dev\" \"npm run electron:dev\"",
+    "package:win": "npm run build && npm run build:electron && electron-builder --win",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^10.0.3",
+    "electron": "^43.1.0",
+    "oxlint": "^1.69.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.1.0",
+    "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "com.desktop.ai.butler",
+    "productName": "桌面 AI 管家",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
