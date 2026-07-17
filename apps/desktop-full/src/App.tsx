@@ -820,6 +820,24 @@ function App() {
       : null
   }
 
+  function getUnavailableModelMessage(files: LocalTextFile[]) {
+    const workbookNames = files.flatMap((file) =>
+      Array.from(file.content.matchAll(/^# 工作表：(.+)$/gm), (match) => match[1]),
+    )
+    const workbookLine =
+      workbookNames.length > 0 ? `\n已识别工作表：${workbookNames.join('、')}。` : ''
+
+    return `文件已成功读取：${files.map((file) => file.name).join('、')}。${workbookLine}
+
+当前使用的是本地演示模型，它不具备真实的数据分析能力，因此我不会把原始文件内容伪装成分析报告。
+
+请在“设置 → 模型 Provider”中选择并配置一个可用模型，然后重新发送这些文件。`
+  }
+
+  function hasUsableModelProvider() {
+    return Boolean(activeProvider && activeProvider.type !== 'mock' && activeProvider.apiKey?.trim())
+  }
+
   function createWorkflowDoneMessage(result: SavedReportResult | null) {
     if (!result) {
       return '分析完成，但当前不是 Electron 桌面环境，报告和计划没有保存。'
@@ -1385,6 +1403,12 @@ ${historyContext}
       createdAt: Date.now(),
     })
 
+    if (!hasUsableModelProvider()) {
+      await streamAssistantMessage(getUnavailableModelMessage([pickedFile]))
+      setAssistantStatus('idle')
+      return
+    }
+
     try {
       const prompt =
         mode === 'user'
@@ -1441,6 +1465,11 @@ ${pickedFile!.content}`
         detail: `${files.length} 个文件`,
         createdAt: Date.now(),
       })
+
+      if (!hasUsableModelProvider()) {
+        await streamAssistantMessage(getUnavailableModelMessage(files))
+        return
+      }
 
       const fileContext = files
         .map((file, index) => `# 文件 ${index + 1}: ${file.name}\n${file.content.slice(0, 3000)}`)
@@ -1518,6 +1547,12 @@ ${fileContext}`,
 
     setMessages((currentMessages) => [...currentMessages, userMessage])
     setAssistantStatus('thinking')
+
+    if (!hasUsableModelProvider()) {
+      await streamAssistantMessage(getUnavailableModelMessage(files))
+      setAssistantStatus('idle')
+      return
+    }
 
     try {
       const fileContext = files

@@ -6,6 +6,7 @@ import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
+import { readXlsxFile } from './excel-parser.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -274,36 +275,6 @@ function readDocxFile(filePath: string) {
   return stripXmlTags(documentXml)
 }
 
-function readXlsxFile(filePath: string) {
-  const entries = readZipEntries(filePath)
-  const sharedXml = entries.get('xl/sharedStrings.xml')?.toString('utf8') ?? ''
-  const sharedStrings = [...sharedXml.matchAll(/<si[\s\S]*?<\/si>/g)].map((match) => stripXmlTags(match[0]))
-  const sheets = [...entries.entries()]
-    .filter(([name]) => /^xl\/worksheets\/sheet\d+\.xml$/.test(name))
-    .sort(([a], [b]) => a.localeCompare(b))
-
-  return sheets
-    .map(([name, xmlBuffer], sheetIndex) => {
-      const xml = xmlBuffer.toString('utf8')
-      const rows = [...xml.matchAll(/<row[\s\S]*?<\/row>/g)]
-        .slice(0, 120)
-        .map((rowMatch) => {
-          return [...rowMatch[0].matchAll(/<c([^>]*)>[\s\S]*?<v>([\s\S]*?)<\/v>[\s\S]*?<\/c>/g)]
-            .map((cellMatch) => {
-              const isSharedString = /t="s"/.test(cellMatch[1])
-              const rawValue = stripXmlTags(cellMatch[2])
-              return isSharedString ? sharedStrings[Number(rawValue)] ?? rawValue : rawValue
-            })
-            .join('\t')
-        })
-        .filter(Boolean)
-        .join('\n')
-
-      return `# Sheet ${sheetIndex + 1} (${path.basename(name)})\n${rows}`
-    })
-    .join('\n\n')
-}
-
 function readPptxFile(filePath: string) {
   const entries = readZipEntries(filePath)
   return [...entries.entries()]
@@ -356,7 +327,7 @@ function readImageInfo(filePath: string) {
   return `这是一个图片文件。\n文件名：${path.basename(filePath)}\n格式：${extension}\n大小：${Math.round(buffer.length / 1024)} KB\n尺寸：${sizeText}\n\n当前版本可以识别图片元信息，但还不能读取图片中的文字。要分析截图、票据、表格图片，需要后续接 OCR Tool。`
 }
 
-function readSupportedFile(filePath: string): PickedTextFile {
+async function readSupportedFile(filePath: string): Promise<PickedTextFile> {
   const extension = path.extname(filePath).toLowerCase()
   let content = ''
 
@@ -365,7 +336,7 @@ function readSupportedFile(filePath: string): PickedTextFile {
   } else if (extension === '.docx') {
     content = readDocxFile(filePath)
   } else if (extension === '.xlsx') {
-    content = readXlsxFile(filePath)
+    content = await readXlsxFile(filePath)
   } else if (extension === '.pptx') {
     content = readPptxFile(filePath)
   } else if (extension === '.pdf') {
@@ -416,7 +387,7 @@ function findDesktopTextFile(query: string) {
   )
 }
 
-function readDirectoryTextFiles(directoryPath: string) {
+async function readDirectoryTextFiles(directoryPath: string) {
   const files = fs
     .readdirSync(directoryPath, { withFileTypes: true })
     .filter((entry) => entry.isFile())
@@ -424,7 +395,7 @@ function readDirectoryTextFiles(directoryPath: string) {
     .filter((filePath) => supportedFileExtensions.has(path.extname(filePath).toLowerCase()))
     .slice(0, 20)
 
-  return files.map(readSupportedFile)
+  return Promise.all(files.map(readSupportedFile))
 }
 
 function getConfigPath() {
@@ -2208,7 +2179,7 @@ ipcMain.handle('file:pick-text', async () => {
   }
 
   const filePath = result.filePaths[0]
-  const file = readSupportedFile(filePath)
+  const file = await readSupportedFile(filePath)
   writeAuditLog({ category: 'file', action: 'file.read', summary: `已读取文件：${file.name}`, metadata: { extension: path.extname(filePath), bytes: fs.statSync(filePath).size } })
   return file
 })
@@ -2259,7 +2230,7 @@ ipcMain.handle('file:pick-text-many', async () => {
   }
 
   const paths = result.filePaths.slice(0, 10)
-  const files = paths.map(readSupportedFile)
+  const files = await Promise.all(paths.map(readSupportedFile))
   writeAuditLog({ category: 'file', action: 'file.read-many', summary: `已读取 ${files.length} 个文件`, metadata: { files: files.map((file) => file.name).join(', ') } })
   return files
 })
@@ -2274,7 +2245,7 @@ ipcMain.handle('file:pick-directory-text', async () => {
     return []
   }
 
-  const files = readDirectoryTextFiles(result.filePaths[0])
+  const files = await readDirectoryTextFiles(result.filePaths[0])
   writeAuditLog({ category: 'file', action: 'directory.read', summary: `已从文件夹读取 ${files.length} 个文件`, metadata: { directory: path.basename(result.filePaths[0]), files: files.map((file) => file.name).join(', ') } })
   return files
 })
@@ -2301,7 +2272,7 @@ ipcMain.handle('file:read-dropped', async (_event, filePath: string) => {
     }
   }
 
-  const file = readSupportedFile(filePath)
+  const file = await readSupportedFile(filePath)
   writeAuditLog({ category: 'file', action: 'file.drop', summary: `已读取拖拽文件：${file.name}`, metadata: { extension, bytes: stat.size } })
   return file
 })
@@ -2314,7 +2285,7 @@ ipcMain.handle('file:read-named-text', async (_event, query: string) => {
     return null
   }
 
-  const file = readSupportedFile(filePath)
+  const file = await readSupportedFile(filePath)
   writeAuditLog({ category: 'file', action: 'file.find-desktop', summary: `已读取桌面文件：${file.name}`, metadata: { extension: path.extname(filePath), bytes: fs.statSync(filePath).size } })
   return file
 })
