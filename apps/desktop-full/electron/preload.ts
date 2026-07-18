@@ -59,4 +59,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openExtensionsFolder: () => ipcRenderer.invoke('platform:open-extensions-folder'),
   invokeCustomTool: (toolId: string, input: string) =>
     ipcRenderer.invoke('tool:invoke-custom', toolId, input),
+  planTripWithAmap: (draft: unknown) => ipcRenderer.invoke('trip:plan-amap', draft),
+  exportTripCard: (card: unknown) => ipcRenderer.invoke('trip:export-card', card),
 })

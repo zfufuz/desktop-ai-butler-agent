@@ -127,4 +127,50 @@ describe('AgentOrchestrator', () => {
     expect(checkpoints[0]).toBe('running')
     expect(checkpoints.at(-1)).toBe('completed')
   })
+
+  it('pauses and resumes from a checkpoint without repeating a tool call', async () => {
+    let pause = false
+    const execute = vi.fn().mockImplementation(async () => {
+      pause = true
+      return { ok: true, summary: '已检索', content: '结果' }
+    })
+    const decide = vi.fn().mockResolvedValue({
+      calls: [{ id: 'same', name: 'searchKnowledge', input: { query: '恢复' } }],
+    })
+    const orchestrator = new AgentOrchestrator({
+      tools: [searchTool], decide, execute, synthesize: vi.fn().mockResolvedValue('完成'),
+      shouldPause: () => pause,
+    })
+    const paused = await orchestrator.run('恢复任务')
+    expect(paused.status).toBe('paused')
+    pause = false
+    const resumed = await orchestrator.run('恢复任务', paused)
+    expect(resumed.status).toBe('completed')
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels before making a decision', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const decide = vi.fn()
+    const run = await new AgentOrchestrator({
+      tools: [searchTool], decide, execute: vi.fn(), synthesize: vi.fn(), signal: controller.signal,
+    }).run('取消任务')
+    expect(run.status).toBe('cancelled')
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stops when the tool-call budget is exhausted', async () => {
+    let sequence = 0
+    const run = await new AgentOrchestrator({
+      tools: [searchTool], maxToolCalls: 1,
+      decide: vi.fn().mockImplementation(async () => ({
+        calls: [{ id: `call-${sequence}`, name: 'searchKnowledge', input: { query: `query-${sequence++}` } }],
+      })),
+      execute: vi.fn().mockResolvedValue({ ok: true, summary: 'ok', content: 'ok' }),
+      synthesize: vi.fn().mockResolvedValue('预算已耗尽'),
+    }).run('预算测试')
+    expect(run.status).toBe('blocked')
+    expect(run.error).toContain('最大 Tool 调用次数')
+  })
 })

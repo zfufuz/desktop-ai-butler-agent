@@ -16,6 +16,7 @@
     "package:win": "npm run build && npm run build:electron && electron-builder --win",
     "lint": "oxlint",
     "test": "vitest run",
+    "eval:validate": "vitest run src/eval",
     "preview": "vite preview"
   },
   "dependencies": {

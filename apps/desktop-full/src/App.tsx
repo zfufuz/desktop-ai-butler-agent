@@ -2,15 +2,19 @@
 import {
   ChevronLeft,
   ChevronRight,
+  CalendarPlus,
+  Download,
   FileText,
   ListChecks,
   Plane,
   ReceiptText,
   Settings,
+  X,
 } from 'lucide-react'
 import './App.css'
 import AvatarPanel from './components/AvatarPanel'
 import AgentRunsPanel, { type AgentRunSnapshot } from './components/AgentRunsPanel'
+import MetricsPanel from './components/MetricsPanel'
 import AuditLogPanel, {
   type AuditLogEntry,
   type AuditLogFilters,
@@ -35,8 +39,8 @@ import type { AssistantStatus, Message } from './type'
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
-type SettingsPage = 'home' | 'provider' | 'rag' | 'skill' | 'tool' | 'installed' | 'data'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
+type SettingsPage = 'home' | 'provider' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -63,6 +67,9 @@ type RagConfig = {
   embeddingProviderId: string
   embeddingModel: string
   embeddingBaseUrl: string
+  rerankerEnabled: boolean
+  rerankerModel: string
+  rerankerBaseUrl: string
   topK: number
 }
 
@@ -82,6 +89,12 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
+  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyName?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  retries?: number
+  version?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -92,6 +105,7 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  deletedBuiltinToolIds?: string[]
 }
 
 type LocalTextFile = {
@@ -155,6 +169,15 @@ type TripDraft = {
   dateText?: string
   nights?: string
   purpose?: string
+}
+
+type TripResultCard = {
+  title: string
+  subtitle: string
+  facts: string[]
+  content: string
+  draft: TripDraft
+  savedToPlan?: boolean
 }
 
 type BuiltinOverride = {
@@ -368,6 +391,10 @@ function parseImportedTool(file: LocalTextFile) {
     endpoint: parsed.endpoint?.trim() || '',
     method,
     apiKey: parsed.apiKey?.trim() || '',
+    apiKeyPlacement: parsed.apiKeyPlacement ?? 'bearer',
+    apiKeyName: parsed.apiKeyName?.trim() || '',
+    timeoutMs: parsed.timeoutMs ?? 20000,
+    retries: parsed.retries ?? 0,
   }
 }
 
@@ -438,9 +465,7 @@ function isPlanStale(plan: ButlerPlan) {
 
 function App() {
   const [isElectronReady, setIsElectronReady] = useState(() => Boolean(window.electronAPI))
-  const [mode, setMode] = useState<ProductMode>(() => {
-    return (localStorage.getItem('ai-butler:mode') as ProductMode | null) ?? 'user'
-  })
+  const mode: ProductMode = 'user'
   const [input, setInput] = useState('')
   const [pendingAttachments, setPendingAttachments] = useState<LocalTextFile[]>([])
   const [assistantStatus, setAssistantStatus] = useState<AssistantStatus>('idle')
@@ -487,6 +512,8 @@ function App() {
   const [pendingFileReadStep, setPendingFileReadStep] = useState<PendingFileReadStep>(null)
   const [pendingTripStep, setPendingTripStep] = useState<PendingTripStep>(null)
   const [tripDraft, setTripDraft] = useState<TripDraft>({})
+  const [tripPlannerOpen, setTripPlannerOpen] = useState(false)
+  const [tripResultCard, setTripResultCard] = useState<TripResultCard | null>(null)
   const [voiceEnabled, setVoiceEnabled] = useState(false)
   const [alwaysOnTop, setAlwaysOnTop] = useState(false)
   const [platformConfig, setPlatformConfig] = useState<AgentPlatformConfig | null>(null)
@@ -534,6 +561,10 @@ function App() {
     endpoint: '',
     method: 'POST' as 'GET' | 'POST',
     apiKey: '',
+    apiKeyPlacement: 'bearer' as 'bearer' | 'query' | 'header',
+    apiKeyName: '',
+    timeoutMs: 20000,
+    retries: 0,
   })
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -615,10 +646,6 @@ function App() {
     )
     return `我当前实际注册了 ${builtinLines.length + customLines.length} 个 Tool。\n\n内置 Tool：\n${builtinLines.join('\n') || '无'}\n\n自定义 HTTP Tool：\n${customLines.join('\n') || '暂无'}。`
   }
-
-  useEffect(() => {
-    localStorage.setItem('ai-butler:mode', mode)
-  }, [mode])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -1109,8 +1136,6 @@ ${progressText}`,
 
   async function runTripPlanner(draft: TripDraft) {
     const enabledTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
-    const weatherTool = findTripTool(enabledTools, 'weather')
-    const transportTool = findTripTool(enabledTools, 'transport')
     const hotelTool = findTripTool(enabledTools, 'hotel')
     const tripInput = `从${draft.origin}去${draft.destination}，时间${draft.dateText}，住${draft.nights}晚，目的：${draft.purpose ?? '普通出差'}`
 
@@ -1122,11 +1147,19 @@ ${progressText}`,
       createdAt: Date.now(),
     })
 
-    const [weatherResult, transportResult, hotelResult] = await Promise.all([
-      invokeOptionalTripTool(weatherTool, `${draft.destination} ${draft.dateText} 天气`),
-      invokeOptionalTripTool(transportTool, `${draft.origin} 到 ${draft.destination} ${draft.dateText} 交通 高铁 飞机 比价`),
+    const [amapResult, hotelResult] = await Promise.all([
+      window.electronAPI.planTripWithAmap({ origin: draft.origin!, destination: draft.destination!, dateText: draft.dateText! }),
       invokeOptionalTripTool(hotelTool, `${draft.destination} ${draft.dateText} 住宿 ${draft.nights}晚 酒店 预算`),
     ])
+    const weatherResult = amapResult.weather
+      ? `${amapResult.weather.date}：白天${amapResult.weather.dayWeather} ${amapResult.weather.dayTemp}℃，夜间${amapResult.weather.nightWeather} ${amapResult.weather.nightTemp}℃，${amapResult.weather.dayWind}风`
+      : '暂无天气数据'
+    const transportResult = amapResult.route
+      ? `驾车距离 ${(amapResult.route.distanceMeters / 1000).toFixed(1)} 公里，预计 ${(amapResult.route.durationSeconds / 3600).toFixed(1)} 小时，过路费约 ${amapResult.route.tolls} 元。高铁和机票价格需另外接入票务 API。`
+      : '暂无路线数据'
+    const safeHotelResult = hotelResult.startsWith('未配置') || hotelResult.includes('调用失败')
+      ? '暂无实时酒店价格，请按公司住宿标准筛选。'
+      : hotelResult
 
     const historyContext = workflowData.reports
       .filter((report) => /出差|差旅|报销|交通|酒店/.test(report.content))
@@ -1135,7 +1168,7 @@ ${progressText}`,
       .join('\n\n') || '暂无历史出差报告。'
 
     const reply = await createAssistantReply(
-      `你是桌面 AI 管家的出差规划 Agent。请基于用户出差需求、历史出差记录和可用 API 结果，生成一份可执行出差计划。
+      `你是桌面 AI 管家的出差建议助手。路线和天气已经由程序验证成功，你只负责生成简短行动建议，不得评价 API 是否可用。
 
 用户需求：
 ${tripInput}
@@ -1147,26 +1180,74 @@ ${weatherResult}
 ${transportResult}
 
 酒店 API 结果：
-${hotelResult}
+${safeHotelResult}
 
 历史出差记录：
 ${historyContext}
 
-请输出：
-1. 出差摘要
-2. 交通建议：比较高铁/飞机/其他交通的成本、时间和风险；如果 API 缺失，要说明需要配置交通 Tool
-3. 天气与携带建议：如果 API 缺失，要说明需要配置天气 Tool
-4. 住宿与预算建议：如果 API 缺失，要说明需要配置酒店 Tool
-5. 报销材料清单
-6. 自动生成的待办计划
-7. 出差后需要记录的数据，用来优化下次出差`,
+请控制在 300 字以内。禁止出现“API 错误、API 数据问题、无法确定交通天气、建议配置 Tool”等表述，禁止重复上面的路线和天气数据。固定结构：
+## 行前待办
+最多 5 条，每条以动词开头。
+## 报销材料
+最多 4 条。不要写空泛建议，不要重复。`,
     )
 
-    await streamAssistantMessage(reply.content)
-    const savedResult = await saveGeneratedReport(reply.content, `${draft.destination ?? '出差'}规划`)
-    await streamAssistantMessage(createWorkflowDoneMessage(savedResult))
+    const factualSummary = `## 行程概览
+
+- **路线**：${transportResult}
+- **天气**：${weatherResult}
+- **住宿**：${safeHotelResult}
+
+${reply.content}`
+    await streamAssistantMessage(factualSummary)
+    const facts = [transportResult, weatherResult]
+    facts.push(`住宿：${safeHotelResult}`)
+    setTripResultCard({
+      title: `${draft.destination}出差行动卡`,
+      subtitle: `${draft.dateText} · ${draft.origin} → ${draft.destination} · ${draft.nights} 晚`,
+      facts,
+      content: factualSummary,
+      draft,
+    })
     setTripDraft({})
     setPendingTripStep(null)
+  }
+
+  async function saveTripCardToPlan() {
+    if (!tripResultCard || !isElectronReady) return
+    const nextData = await window.electronAPI.savePlan({
+      title: tripResultCard.title,
+      description: `${tripResultCard.subtitle}\n${tripResultCard.facts.join('\n')}`,
+      priority: 'high', dueDate: tripResultCard.draft.dateText, nextAction: '确认交通与住宿预订',
+    })
+    setWorkflowData(nextData)
+    setTripResultCard({ ...tripResultCard, savedToPlan: true })
+  }
+
+  async function downloadTripCard() {
+    if (!tripResultCard || !isElectronReady) return
+    await window.electronAPI.exportTripCard({
+      title: tripResultCard.title,
+      content: `${tripResultCard.subtitle}\n\n${tripResultCard.facts.map((fact) => `- ${fact}`).join('\n')}\n\n${tripResultCard.content}`,
+    })
+  }
+
+  async function submitTripPlannerForm() {
+    const missingFields = getMissingTripFields(tripDraft)
+    if (missingFields.length > 0 || isThinking) return
+    const requestText = `从${tripDraft.origin}去${tripDraft.destination}，${tripDraft.dateText}出发，住${tripDraft.nights}晚，目的：${tripDraft.purpose?.trim() || '普通出差'}`
+    setTripPlannerOpen(false)
+    setMessages((currentMessages) => [...currentMessages, {
+      id: createMessageId(), role: 'user', content: requestText, createdAt: Date.now(),
+    }])
+    setAssistantStatus('thinking')
+    try {
+      await runTripPlanner(tripDraft)
+    } catch {
+      await streamAssistantMessage('出差规划暂时没有完成。请检查模型服务和高德 Tool 配置后重试。')
+    } finally {
+      setAssistantStatus('idle')
+    }
   }
 
   async function handleTripPlanning(text: string) {
@@ -1962,6 +2043,11 @@ ${fileContext}`,
       endpoint: customToolForm.endpoint.trim(),
       method: customToolForm.method,
       apiKey: customToolForm.apiKey.trim() || undefined,
+      apiKeyPlacement: customToolForm.apiKeyPlacement,
+      apiKeyName: customToolForm.apiKeyName.trim() || undefined,
+      timeoutMs: customToolForm.timeoutMs,
+      retries: customToolForm.retries,
+      version: '1.0.0',
       enabled: true,
     }
 
@@ -1977,6 +2063,10 @@ ${fileContext}`,
       endpoint: '',
       method: 'POST',
       apiKey: '',
+      apiKeyPlacement: 'bearer',
+      apiKeyName: '',
+      timeoutMs: 20000,
+      retries: 0,
     })
     setEditingToolId(null)
   }
@@ -2090,6 +2180,9 @@ ${fileContext}`,
     await savePlatformConfig({
       ...platformConfig,
       customTools: platformConfig.customTools.filter((tool) => tool.id !== toolId),
+      deletedBuiltinToolIds: toolId.startsWith('builtin-')
+        ? [...new Set([...(platformConfig.deletedBuiltinToolIds ?? []), toolId])]
+        : platformConfig.deletedBuiltinToolIds,
     })
   }
 
@@ -2101,6 +2194,10 @@ ${fileContext}`,
       endpoint: tool.endpoint,
       method: tool.method,
       apiKey: tool.apiKey ?? '',
+      apiKeyPlacement: tool.apiKeyPlacement ?? 'bearer',
+      apiKeyName: tool.apiKeyName ?? '',
+      timeoutMs: tool.timeoutMs ?? 20000,
+      retries: tool.retries ?? 0,
     })
     setSettingsPage('tool')
   }
@@ -2422,7 +2519,8 @@ ${result.content}
     }
 
     if (scenario === 'trip') {
-      setInput('我下周三要从北京去上海出差，住 1 晚，目的：客户拜访。帮我规划交通、天气、住宿、预算和报销清单。')
+      setTripDraft({})
+      setTripPlannerOpen(true)
       return
     }
 
@@ -2447,6 +2545,9 @@ ${result.content}
   }
 
   function renderWorkspaceHome() {
+    return renderCoreWorkspaceHome()
+    /* Legacy workspace entries remain below temporarily while detail views are split into components. */
+    /* oxlint-disable no-unreachable */
     return (
       <>
         <div className="workspace-intro">
@@ -2490,6 +2591,13 @@ ${result.content}
             <small>查看目标、执行轮次、工具观察和失败原因。</small>
           </span>
           <b>{agentRuns.length} 次</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('metrics')}>
+          <span>
+            <strong>Agent 指标</strong>
+            <small>查看成功率、工具表现、执行轮数、失败分布和响应延迟。</small>
+          </span>
+          <b>Metrics</b>
         </button>
         <button className="settings-entry workspace-entry" onClick={openAuditLogs}>
           <span>
@@ -2587,6 +2695,10 @@ ${result.content}
 
     if (workspacePage === 'runs') {
       return <AgentRunsPanel runs={agentRuns} />
+    }
+
+    if (workspacePage === 'metrics') {
+      return <MetricsPanel runs={agentRuns} logs={auditLogs} />
     }
 
     if (workspacePage === 'logs') {
@@ -2870,6 +2982,29 @@ ${result.content}
     )
   }
 
+  function renderCoreWorkspaceHome() {
+    return (
+      <div className="core-workspace-grid">
+        <button className="settings-entry workspace-entry highlight" onClick={() => setWorkspacePage('plans')}>
+          <span><strong>今日任务</strong><small>今天要推进的计划、提醒和停滞项。</small></span>
+          <b>{todayPlans.length} 个</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('reports')}>
+          <span><strong>报告</strong><small>查看分析结论并悬浮到桌面。</small></span>
+          <b>{workflowData.reports.length} 份</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('plans')}>
+          <span><strong>计划</strong><small>记录进度、AI 复盘并调整下一步。</small></span>
+          <b>{activePlans.length} 个</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('knowledge')}>
+          <span><strong>资料库</strong><small>管理本地资料和来源检索。</small></span>
+          <b>{knowledgeIndex.length} 份</b>
+        </button>
+      </div>
+    )
+  }
+
   function renderUserWorkspacePanel() {
     return (
       <>
@@ -2885,7 +3020,7 @@ ${result.content}
 
   return (
     <main
-      className={`app-shell ${mode === 'developer' ? 'developer-mode' : 'user-mode'} ${isDraggingFile ? 'dragging-file' : ''}`}
+      className={`app-shell user-mode ${isDraggingFile ? 'dragging-file' : ''}`}
       style={{
         gridTemplateColumns: `${leftPanelCollapsed ? 44 : leftPanelWidth}px 6px minmax(420px, 1fr) 6px ${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
       }}
@@ -2933,24 +3068,9 @@ ${result.content}
           <div>
             <div className="eyebrow">Desktop Butler Agent</div>
             <h1>桌面 AI 管家</h1>
-            <p>
-              {mode === 'user'
-                ? '把资料、行程、计划和工具串起来，让事情更省心'
-                : 'Provider / Skill / Tool / RAG / Agent Timeline'}
-            </p>
+            <p>把资料、行程、计划和工具串起来，让事情更省心</p>
           </div>
           <div className="header-actions">
-            <div className="mode-switch" aria-label="版本切换">
-              <button className={mode === 'user' ? 'active' : ''} onClick={() => setMode('user')}>
-                普通版
-              </button>
-              <button
-                className={mode === 'developer' ? 'active' : ''}
-                onClick={() => setMode('developer')}
-              >
-                开发者版
-              </button>
-            </div>
             <button className="settings-button" onClick={() => setSettingsOpen(true)}>
               <Settings aria-hidden="true" size={17} />
               <span>设置</span>
@@ -2974,14 +3094,32 @@ ${result.content}
             <strong>报销整理</strong>
             <span>找异常、缺票、超预算并持续跟踪</span>
           </button>
-          <button onClick={() => startButlerScenario(mode === 'user' ? 'today' : 'workReport')}>
+          <button onClick={() => startButlerScenario('today')}>
             <ListChecks aria-hidden="true" size={18} />
-            <strong>{mode === 'user' ? '今日任务' : '工作汇报'}</strong>
-            <span>{mode === 'user' ? '提醒、进度复盘和停滞拆解' : '根据记录生成汇报'}</span>
+            <strong>今日任务</strong>
+            <span>提醒、进度复盘和停滞拆解</span>
           </button>
         </section>
 
         <MessageList messages={messages} />
+
+        {tripResultCard && (
+          <section className="trip-result-card" aria-label="出差行动卡">
+            <div className="trip-result-heading">
+              <div><strong>{tripResultCard.title}</strong><span>{tripResultCard.subtitle}</span></div>
+              <button className="icon-button" title="关闭行程卡" onClick={() => setTripResultCard(null)}><X size={16} /></button>
+            </div>
+            <div className="trip-result-facts">
+              {tripResultCard.facts.slice(0, 3).map((fact) => <span key={fact}>{fact}</span>)}
+            </div>
+            <div className="trip-result-actions">
+              <button onClick={() => void downloadTripCard()}><Download size={16} />下载</button>
+              <button className="primary" onClick={() => void saveTripCardToPlan()} disabled={tripResultCard.savedToPlan}>
+                <CalendarPlus size={16} />{tripResultCard.savedToPlan ? '已加入计划' : '加入计划'}
+              </button>
+            </div>
+          </section>
+        )}
 
         <ChatInput
           input={input}
@@ -3013,7 +3151,7 @@ ${result.content}
         </button>
         {!rightPanelCollapsed && (
           <>
-        <h2>{mode === 'user' ? '管家工作台' : '开发者控制台'}</h2>
+        <h2>管家工作台</h2>
 
         <div className="insight-section status-card">
           <h3>当前状态</h3>
@@ -3125,6 +3263,38 @@ ${result.content}
         )}
       </aside>
 
+      {tripPlannerOpen && (
+        <div className="settings-overlay trip-planner-overlay" role="presentation">
+          <section className="settings-dialog trip-planner-dialog" role="dialog" aria-modal="true" aria-labelledby="trip-planner-title">
+            <header>
+              <div>
+                <div className="eyebrow">Travel workflow</div>
+                <h2 id="trip-planner-title">出差规划</h2>
+              </div>
+              <button onClick={() => setTripPlannerOpen(false)}>关闭</button>
+            </header>
+            <p className="settings-help">填写基本行程后，管家会查询天气和路线，并生成预算、报销清单与待办计划。</p>
+            <div className="trip-form-grid">
+              <label>出发地<input autoFocus value={tripDraft.origin ?? ''} placeholder="例如 北京"
+                onChange={(event) => setTripDraft({ ...tripDraft, origin: event.target.value })} /></label>
+              <label>目的地<input value={tripDraft.destination ?? ''} placeholder="例如 上海"
+                onChange={(event) => setTripDraft({ ...tripDraft, destination: event.target.value })} /></label>
+              <label>出发日期<input type="date" value={tripDraft.dateText ?? ''}
+                onChange={(event) => setTripDraft({ ...tripDraft, dateText: event.target.value })} /></label>
+              <label>住宿晚数<input type="number" min="0" max="30" value={tripDraft.nights ?? ''} placeholder="0"
+                onChange={(event) => setTripDraft({ ...tripDraft, nights: event.target.value })} /></label>
+              <label className="trip-purpose-field">出差目的<input value={tripDraft.purpose ?? ''} placeholder="例如 客户拜访、培训或会议"
+                onChange={(event) => setTripDraft({ ...tripDraft, purpose: event.target.value })} /></label>
+            </div>
+            <div className="trip-form-actions">
+              <button onClick={() => setTripPlannerOpen(false)}>取消</button>
+              <button className="panel-action-button" onClick={() => void submitTripPlannerForm()}
+                disabled={getMissingTripFields(tripDraft).length > 0 || isThinking}>开始规划</button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {settingsOpen && (
         <div className="settings-overlay">
           <section className="settings-dialog">
@@ -3145,38 +3315,24 @@ ${result.content}
               <>
                 <button className="settings-entry" onClick={() => setSettingsPage('provider')}>
                   <span>
-                    <strong>模型 Provider</strong>
-                    <small>切换大模型，添加 OpenAI Compatible / 智谱接口。</small>
+                    <strong>模型服务</strong>
+                    <small>选择当前模型，管理 API Key 和兼容接口。</small>
                   </span>
                   <b>{activeProvider?.name ?? '未加载'}</b>
                 </button>
-                <button className="settings-entry" onClick={() => setSettingsPage('rag')}>
+                <button className="settings-entry" onClick={() => setSettingsPage('extensions')}>
                   <span>
-                    <strong>RAG 检索引擎</strong>
-                    <small>Embedding、混合检索、重排和上下文压缩。</small>
+                    <strong>扩展能力</strong>
+                    <small>安装和管理 Skill、Tool 与本地扩展包。</small>
                   </span>
-                  <b>{platformConfig?.rag.embeddingEnabled ? '混合检索' : 'BM25'}</b>
+                  <b>{(platformConfig?.customSkills.length ?? 0) + (platformConfig?.customTools.length ?? 0)} 个</b>
                 </button>
-                <button className="settings-entry" onClick={() => setSettingsPage('skill')}>
+                <button className="settings-entry" onClick={() => setSettingsPage('advanced')}>
                   <span>
-                    <strong>安装 Prompt Skill</strong>
-                    <small>手动创建或从本地导入 Skill 配置。</small>
+                    <strong>高级设置</strong>
+                    <small>RAG、Agent 运行、评测、指标和审计日志。</small>
                   </span>
-                  <b>{platformConfig?.customSkills.length ?? 0} 个</b>
-                </button>
-                <button className="settings-entry" onClick={() => setSettingsPage('tool')}>
-                  <span>
-                    <strong>安装 HTTP API Tool</strong>
-                    <small>连接外部 API，让 Agent 调用工具。</small>
-                  </span>
-                  <b>{platformConfig?.customTools.length ?? 0} 个</b>
-                </button>
-                <button className="settings-entry" onClick={() => setSettingsPage('installed')}>
-                  <span>
-                    <strong>已安装管理</strong>
-                    <small>查看、编辑、禁用或删除已安装的 Skill 和 Tool。</small>
-                  </span>
-                  <b>管理</b>
+                  <b>高级</b>
                 </button>
                 <button className="settings-entry" onClick={() => setSettingsPage('data')}>
                   <span>
@@ -3184,13 +3340,6 @@ ${result.content}
                     <small>导出本地备份、打开数据目录或清理工作数据。</small>
                   </span>
                   <b>本地</b>
-                </button>
-                <button className="settings-entry" onClick={openExtensionsFolder}>
-                  <span>
-                    <strong>扩展文件夹</strong>
-                    <small>把 Skill / Tool 扩展包放到这里，系统会自动读取。</small>
-                  </span>
-                  <b>打开</b>
                 </button>
                 <label className="settings-row">
                   <span>语音朗读</span>
@@ -3212,6 +3361,52 @@ ${result.content}
                   <strong>{alwaysOnTop ? '已开启' : '未开启'}</strong>
                 </button>
               </>
+            )}
+
+            {settingsPage === 'extensions' && (
+              <div className="settings-block settings-category-grid">
+                <h3>扩展能力</h3>
+                <p className="settings-help">安装、查看和管理管家可以调用的 Skill 与 Tool。</p>
+                <button className="settings-entry" onClick={() => setSettingsPage('installed')}>
+                  <span><strong>已安装扩展</strong><small>查看、编辑、禁用或删除 Skill 和 Tool。</small></span>
+                  <b>管理</b>
+                </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('skill')}>
+                  <span><strong>添加 Prompt Skill</strong><small>手动创建或从本地文件导入。</small></span>
+                  <b>添加</b>
+                </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('tool')}>
+                  <span><strong>添加 HTTP API Tool</strong><small>连接天气、路线或其他外部服务。</small></span>
+                  <b>添加</b>
+                </button>
+                <button className="settings-entry" onClick={openExtensionsFolder}>
+                  <span><strong>扩展文件夹</strong><small>放入扩展包后由系统自动读取。</small></span>
+                  <b>打开</b>
+                </button>
+              </div>
+            )}
+
+            {settingsPage === 'advanced' && (
+              <div className="settings-block settings-category-grid">
+                <h3>高级设置</h3>
+                <p className="settings-help">面向调试、检索优化和 Agent 效果验证的技术选项。</p>
+                <button className="settings-entry" onClick={() => setSettingsPage('rag')}>
+                  <span><strong>RAG 检索</strong><small>Embedding、混合检索、Reranker 和上下文压缩。</small></span>
+                  <b>{platformConfig?.rag.embeddingEnabled ? '混合' : 'BM25'}</b>
+                </button>
+                <button className="settings-entry" onClick={() => { setSettingsOpen(false); setWorkspacePage('runs') }}>
+                  <span><strong>Agent 运行记录</strong><small>查看决策轮次、工具观察、暂停和失败原因。</small></span>
+                  <b>{agentRuns.length} 次</b>
+                </button>
+                <button className="settings-entry" onClick={() => { setSettingsOpen(false); setWorkspacePage('metrics') }}>
+                  <span><strong>Eval 与指标</strong><small>查看成功率、工具表现、RAG 模式和响应延迟。</small></span>
+                  <b>Metrics</b>
+                </button>
+                <button className="settings-entry" onClick={() => { setSettingsOpen(false); void openAuditLogs() }}>
+                  <span><strong>审计日志</strong><small>检查 Agent、工具、文件、配置和系统错误。</small></span>
+                  <b>日志</b>
+                </button>
+              </div>
             )}
 
             {settingsPage === 'provider' && platformConfig && (
@@ -3311,6 +3506,33 @@ ${result.content}
                     onChange={(event) => setPlatformConfig({
                       ...platformConfig,
                       rag: { ...platformConfig.rag, embeddingBaseUrl: event.target.value },
+                    })}
+                  />
+                  <label className="settings-row">
+                    <span>启用模型级 Reranker</span>
+                    <input
+                      type="checkbox"
+                      checked={platformConfig.rag.rerankerEnabled}
+                      onChange={(event) => setPlatformConfig({
+                        ...platformConfig,
+                        rag: { ...platformConfig.rag, rerankerEnabled: event.target.checked },
+                      })}
+                    />
+                  </label>
+                  <input
+                    value={platformConfig.rag.rerankerModel}
+                    placeholder="重排模型，例如 rerank"
+                    onChange={(event) => setPlatformConfig({
+                      ...platformConfig,
+                      rag: { ...platformConfig.rag, rerankerModel: event.target.value },
+                    })}
+                  />
+                  <input
+                    value={platformConfig.rag.rerankerBaseUrl}
+                    placeholder="Reranker 完整 URL"
+                    onChange={(event) => setPlatformConfig({
+                      ...platformConfig,
+                      rag: { ...platformConfig.rag, rerankerBaseUrl: event.target.value },
                     })}
                   />
                   <label>
@@ -3416,6 +3638,32 @@ ${result.content}
                       setCustomToolForm({ ...customToolForm, apiKey: event.target.value })
                     }
                   />
+                  <select
+                    value={customToolForm.apiKeyPlacement}
+                    onChange={(event) => setCustomToolForm({
+                      ...customToolForm,
+                      apiKeyPlacement: event.target.value as 'bearer' | 'query' | 'header',
+                    })}
+                  >
+                    <option value="bearer">Authorization Bearer</option>
+                    <option value="query">URL 查询参数 / 模板</option>
+                    <option value="header">自定义 Header</option>
+                  </select>
+                  <input
+                    value={customToolForm.apiKeyName}
+                    placeholder="Key 参数名，例如 key 或 X-API-Key"
+                    onChange={(event) => setCustomToolForm({ ...customToolForm, apiKeyName: event.target.value })}
+                  />
+                  <label>
+                    超时（毫秒）
+                    <input type="number" min="1000" max="60000" value={customToolForm.timeoutMs}
+                      onChange={(event) => setCustomToolForm({ ...customToolForm, timeoutMs: Number(event.target.value) })} />
+                  </label>
+                  <label>
+                    失败重试次数
+                    <input type="number" min="0" max="3" value={customToolForm.retries}
+                      onChange={(event) => setCustomToolForm({ ...customToolForm, retries: Number(event.target.value) })} />
+                  </label>
                   <button onClick={addCustomTool}>{editingToolId ? '保存 Tool' : '安装 Tool'}</button>
                 </div>
               </div>

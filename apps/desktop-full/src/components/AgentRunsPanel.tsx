@@ -1,7 +1,7 @@
 export type AgentRunSnapshot = {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'blocked' | 'failed'
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
   turns: number
   startedAt: number
   finishedAt?: number
@@ -18,6 +18,9 @@ function getStatusLabel(status: AgentRunSnapshot['status']) {
   if (status === 'completed') return '已完成'
   if (status === 'failed') return '失败'
   if (status === 'blocked') return '受阻'
+  if (status === 'paused') return '已暂停'
+  if (status === 'cancelled') return '已取消'
+  if (status === 'queued') return '排队中'
   return '运行中'
 }
 

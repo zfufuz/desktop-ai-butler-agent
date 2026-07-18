@@ -31,6 +31,9 @@ type RagConfig = {
   embeddingProviderId: string
   embeddingModel: string
   embeddingBaseUrl: string
+  rerankerEnabled: boolean
+  rerankerModel: string
+  rerankerBaseUrl: string
   topK: number
 }
 
@@ -50,6 +53,12 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
+  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyName?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  retries?: number
+  version?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -106,7 +115,7 @@ type ButlerWorkspaceData = {
 type StoredAgentRun = {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'blocked' | 'failed'
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
   turns: number
   startedAt: number
   finishedAt?: number
@@ -163,6 +172,7 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  deletedBuiltinToolIds?: string[]
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -810,7 +820,7 @@ function saveAgentRun(value: unknown) {
     throw new Error('Agent run is missing required fields')
   }
 
-  const allowedStatuses = new Set<StoredAgentRun['status']>(['running', 'completed', 'blocked', 'failed'])
+  const allowedStatuses = new Set<StoredAgentRun['status']>(['queued', 'running', 'paused', 'cancelled', 'completed', 'blocked', 'failed'])
   const savedRun: StoredAgentRun = {
     id: run.id.slice(0, 120),
     goal: run.goal.slice(0, 4000),
@@ -833,7 +843,7 @@ function saveAgentRun(value: unknown) {
     action: 'agent.run.save',
     summary: `Agent 任务${savedRun.status === 'completed' ? '完成' : savedRun.status === 'failed' ? '失败' : savedRun.status === 'blocked' ? '受阻' : '运行中'}：${savedRun.goal.slice(0, 120)}`,
     detail: savedRun.error,
-    status: savedRun.status === 'failed' ? 'failure' : savedRun.status === 'running' ? 'pending' : 'success',
+    status: savedRun.status === 'failed' ? 'failure' : ['queued', 'running', 'paused'].includes(savedRun.status) ? 'pending' : 'success',
     runId: savedRun.id,
     durationMs: savedRun.finishedAt ? savedRun.finishedAt - savedRun.startedAt : undefined,
     metadata: { turns: savedRun.turns, observations: savedRun.observations.length },
@@ -945,6 +955,37 @@ async function requestEmbeddingVectors(texts: string[]) {
     throw new Error('Embedding provider returned an invalid vector count')
   }
   return { vectors, model: runtime.model }
+}
+
+async function rerankWithModel(query: string, candidates: ReturnType<typeof rerankHybridCandidates>) {
+  const config = readPlatformConfig()
+  if (!config.rag.rerankerEnabled || candidates.length === 0) return null
+  const provider = config.providers.find((item) => item.id === config.rag.embeddingProviderId)
+  if (!provider?.apiKey || provider.type === 'mock') return null
+  const endpoint = validateHttpEndpoint(config.rag.rerankerBaseUrl.trim(), 'Reranker Provider')
+  const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(30_000),
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${provider.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: config.rag.rerankerModel.trim(),
+      query,
+      documents: candidates.map((candidate) => candidate.content),
+      top_n: candidates.length,
+      return_documents: false,
+    }),
+  })
+  if (!response.ok) throw new Error(`Reranker provider request failed: ${response.status}`)
+  const payload = await response.json() as { results?: Array<{ index?: number; relevance_score?: number }> }
+  const ranked = (payload.results ?? [])
+    .filter((item): item is { index: number; relevance_score?: number } => (
+      Number.isInteger(item.index) && Number(item.index) >= 0 && Number(item.index) < candidates.length
+    ))
+    .map((item) => ({ ...candidates[item.index], modelRerankScore: Number(item.relevance_score ?? 0) }))
+  return ranked.length === candidates.length ? ranked : null
 }
 
 async function indexDocumentEmbeddings(documentId: string, chunks: string[]) {
@@ -1137,7 +1178,15 @@ async function searchKnowledge(query: string, requestedLimit = 5): Promise<Knowl
     writeAuditLog({ category: 'knowledge', action: 'knowledge.vector-search', summary: '向量检索失败，已降级为 BM25', detail: error, status: 'failure', level: 'warn' })
   }
 
-  return rerankHybridCandidates([...candidates.values()], terms, limit).map((result) => ({
+  const locallyRanked = rerankHybridCandidates([...candidates.values()], terms, Math.min(candidateLimit, 20))
+  let ranked = locallyRanked
+  try {
+    ranked = (await rerankWithModel(query, locallyRanked)) ?? locallyRanked
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.rerank', summary: '模型重排失败，已降级为本地重排', detail: error, status: 'failure', level: 'warn' })
+  }
+
+  return ranked.slice(0, limit).map((result) => ({
     documentId: result.documentId,
     documentName: result.documentName,
     chunkIndex: result.chunkIndex,
@@ -1520,6 +1569,12 @@ function parseExtensionTool(filePath: string): CustomToolConfig | null {
       endpoint: parsed.endpoint.trim(),
       method: parsed.method === 'GET' ? 'GET' : 'POST',
       apiKey: parsed.apiKey?.trim() || undefined,
+      apiKeyPlacement: parsed.apiKeyPlacement ?? 'bearer',
+      apiKeyName: parsed.apiKeyName?.trim() || undefined,
+      headers: parsed.headers,
+      timeoutMs: parsed.timeoutMs,
+      retries: parsed.retries,
+      version: parsed.version?.trim() || '1.0.0',
       enabled: parsed.enabled !== false,
       source: 'extension',
     }
@@ -1548,6 +1603,7 @@ function scanExtensionConfigs() {
 
 function createDefaultConfig(): AgentPlatformConfig {
   const zhipuApiKey = localEnv.ZHIPU_API_KEY ?? ''
+  const amapApiKey = localEnv.AMAP_API_KEY ?? ''
   const zhipuModel = localEnv.ZHIPU_MODEL ?? 'glm-4-flash'
   const providers: ModelProviderConfig[] = [
     {
@@ -1570,12 +1626,41 @@ function createDefaultConfig(): AgentPlatformConfig {
     activeProviderId: zhipuApiKey ? 'zhipu-default' : 'mock',
     providers,
     customSkills: [],
-    customTools: [],
+    customTools: amapApiKey ? [
+      {
+        id: 'builtin-amap-geocode',
+        name: '高德地点解析',
+        description: '把城市、地址、车站、机场或酒店名称转换为经纬度，供路线规划使用。',
+        endpoint: 'https://restapi.amap.com/v3/geocode/geo?address={{input}}&key={{apiKey}}',
+        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
+      },
+      {
+        id: 'builtin-amap-weather',
+        name: '高德天气查询',
+        description: '查询中国城市当前天气和未来天气预报。输入应包含城市名称和日期要求。',
+        endpoint: 'https://restapi.amap.com/v3/weather/weatherInfo?city={{city}}&extensions=all&key={{apiKey}}',
+        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
+      },
+      {
+        id: 'builtin-amap-route',
+        name: '高德路线规划',
+        description: '根据起点和终点经纬度查询驾车路线、距离与预计耗时。输入格式：起点经度,纬度 到 终点经度,纬度。',
+        endpoint: 'https://restapi.amap.com/v5/direction/driving?origin={{origin}}&destination={{destination}}&key={{apiKey}}&show_fields=cost',
+        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 15000, retries: 1, version: '1.0.0', enabled: true,
+      },
+    ] : [],
+    deletedBuiltinToolIds: [],
     rag: {
       embeddingEnabled: false,
       embeddingProviderId: 'zhipu-default',
       embeddingModel: 'embedding-3',
       embeddingBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/embeddings',
+      rerankerEnabled: false,
+      rerankerModel: 'rerank',
+      rerankerBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/rerank',
       topK: 5,
     },
   }
@@ -1603,6 +1688,18 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
     ? savedConfig.activeProviderId ?? defaultConfig.activeProviderId
     : defaultConfig.activeProviderId
 
+  const deletedBuiltinToolIds = savedConfig.deletedBuiltinToolIds ?? []
+  const defaultToolMap = new Map(defaultConfig.customTools.map((tool) => [tool.id, tool]))
+  const mergedManualTools = new Map<string, CustomToolConfig>()
+  for (const tool of savedConfig.customTools ?? []) {
+    if (tool.id.startsWith('extension:')) continue
+    const builtin = defaultToolMap.get(tool.id)
+    mergedManualTools.set(tool.id, builtin ? { ...builtin, ...tool, apiKey: builtin.apiKey } : tool)
+  }
+  for (const tool of defaultConfig.customTools) {
+    if (!deletedBuiltinToolIds.includes(tool.id) && !mergedManualTools.has(tool.id)) mergedManualTools.set(tool.id, tool)
+  }
+
   return {
     activeProviderId,
     providers,
@@ -1610,10 +1707,8 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
       ...(savedConfig.customSkills ?? []).filter((skill) => !skill.id.startsWith('extension:')),
       ...extensionConfig.customSkills,
     ],
-    customTools: [
-      ...(savedConfig.customTools ?? []).filter((tool) => !tool.id.startsWith('extension:')),
-      ...extensionConfig.customTools,
-    ],
+    customTools: [...mergedManualTools.values(), ...extensionConfig.customTools],
+    deletedBuiltinToolIds,
     rag: {
       ...defaultConfig.rag,
       ...(savedConfig.rag ?? {}),
@@ -1900,17 +1995,20 @@ function extractToolVariables(input: string) {
     input.match(/(?:今天|明天|后天)?([^，。,.?\s]{2,12})(?:的)?天气/) ??
     input.match(/天气.*?(?:在|查|看)?([^，。,.?\s]{2,12})/)
 
+  const routeMatch = input.match(/(-?\d{2,3}(?:\.\d+)?\s*,\s*-?\d{1,2}(?:\.\d+)?)\s*(?:到|至|->|→)\s*(-?\d{2,3}(?:\.\d+)?\s*,\s*-?\d{1,2}(?:\.\d+)?)/)
   return {
     input,
     city: cityMatch?.[1]?.replace(/我想|帮我|查询|看看|今天|明天|后天/g, '') || input,
+    origin: routeMatch?.[1]?.replace(/\s/g, '') || input,
+    destination: routeMatch?.[2]?.replace(/\s/g, '') || input,
   }
 }
 
-function applyToolTemplate(template: string, input: string) {
+function applyToolTemplate(template: string, input: string, apiKey = '') {
   const variables = extractToolVariables(input)
 
   return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_match, key: string) => {
-    const value = variables[key as keyof typeof variables] ?? input
+    const value = key === 'apiKey' ? apiKey : variables[key as keyof typeof variables] ?? input
     return encodeURIComponent(value)
   })
 }
@@ -1925,20 +2023,35 @@ async function invokeCustomTool(toolId: string, input: string) {
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...(tool.headers ?? {}),
   }
 
-  if (tool.apiKey) {
+  if (tool.apiKey && (tool.apiKeyPlacement ?? 'bearer') === 'bearer') {
     headers.Authorization = `Bearer ${tool.apiKey}`
   }
+  if (tool.apiKey && tool.apiKeyPlacement === 'header') {
+    headers[tool.apiKeyName || 'X-API-Key'] = tool.apiKey
+  }
 
-  const endpoint = validateHttpEndpoint(applyToolTemplate(tool.endpoint, input), 'Tool Endpoint')
-
-  const response = await fetch(endpoint, {
-    signal: AbortSignal.timeout(20_000),
-    method: tool.method,
-    headers,
-    body: tool.method === 'POST' ? JSON.stringify(extractToolVariables(input)) : undefined,
-  })
+  const endpoint = validateHttpEndpoint(applyToolTemplate(tool.endpoint, input, tool.apiKey), 'Tool Endpoint')
+  const retries = Math.max(0, Math.min(Number(tool.retries) || 0, 3))
+  let response: Response | null = null
+  let lastError: unknown
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      response = await fetch(endpoint, {
+        signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(tool.timeoutMs) || 20_000, 60_000))),
+        method: tool.method,
+        headers,
+        body: tool.method === 'POST' ? JSON.stringify(extractToolVariables(input)) : undefined,
+      })
+      if (response.ok || response.status < 500 || attempt === retries) break
+    } catch (error) {
+      lastError = error
+      if (attempt === retries) throw error
+    }
+  }
+  if (!response) throw lastError instanceof Error ? lastError : new Error('Tool request failed')
 
   const text = await readResponseTextLimited(response)
 
@@ -1950,6 +2063,74 @@ async function invokeCustomTool(toolId: string, input: string) {
     name: tool.name,
     content: text.slice(0, 8000),
   }
+}
+
+async function requestAmapJson(endpoint: string) {
+  const response = await fetch(validateHttpEndpoint(endpoint, '高德 Web 服务'), { signal: AbortSignal.timeout(20_000) })
+  const payload = await response.json() as Record<string, unknown>
+  if (!response.ok || String(payload.status) !== '1') {
+    throw new Error(`高德 API 调用失败：${String(payload.info ?? response.status)}`)
+  }
+  return payload
+}
+
+async function planTripWithAmap(value: unknown) {
+  const draft = value as { origin?: unknown; destination?: unknown; dateText?: unknown }
+  const origin = String(draft.origin ?? '').trim().slice(0, 120)
+  const destination = String(draft.destination ?? '').trim().slice(0, 120)
+  const dateText = String(draft.dateText ?? '').trim().slice(0, 40)
+  const key = localEnv.AMAP_API_KEY?.trim()
+  if (!origin || !destination) throw new Error('出发地和目的地不能为空')
+  if (!key) throw new Error('未配置高德 Web 服务 Key')
+
+  const geocode = async (address: string) => {
+    const payload = await requestAmapJson(`https://restapi.amap.com/v3/geocode/geo?address=${encodeURIComponent(address)}&key=${encodeURIComponent(key)}`)
+    const item = (payload.geocodes as Array<Record<string, unknown>> | undefined)?.[0]
+    if (!item?.location) throw new Error(`高德没有找到地点：${address}`)
+    return { location: String(item.location), adcode: String(item.adcode ?? ''), formattedAddress: String(item.formatted_address ?? address) }
+  }
+
+  const [originLocation, destinationLocation] = await Promise.all([geocode(origin), geocode(destination)])
+  const [weatherPayload, routePayload] = await Promise.all([
+    requestAmapJson(`https://restapi.amap.com/v3/weather/weatherInfo?city=${encodeURIComponent(destinationLocation.adcode)}&extensions=all&key=${encodeURIComponent(key)}`),
+    requestAmapJson(`https://restapi.amap.com/v5/direction/driving?origin=${encodeURIComponent(originLocation.location)}&destination=${encodeURIComponent(destinationLocation.location)}&key=${encodeURIComponent(key)}&show_fields=cost`),
+  ])
+  const forecast = (weatherPayload.forecasts as Array<Record<string, unknown>> | undefined)?.[0]
+  const casts = (forecast?.casts as Array<Record<string, unknown>> | undefined) ?? []
+  const selectedWeather = casts.find((cast) => String(cast.date) === dateText) ?? casts[0]
+  const route = routePayload.route as Record<string, unknown> | undefined
+  const pathItem = (route?.paths as Array<Record<string, unknown>> | undefined)?.[0]
+  const cost = pathItem?.cost as Record<string, unknown> | undefined
+  const result = {
+    origin: originLocation.formattedAddress,
+    destination: destinationLocation.formattedAddress,
+    dateText,
+    weather: selectedWeather ? {
+      date: String(selectedWeather.date ?? dateText), dayWeather: String(selectedWeather.dayweather ?? ''),
+      nightWeather: String(selectedWeather.nightweather ?? ''), dayTemp: String(selectedWeather.daytemp ?? ''),
+      nightTemp: String(selectedWeather.nighttemp ?? ''), dayWind: String(selectedWeather.daywind ?? ''),
+    } : null,
+    route: pathItem ? {
+      distanceMeters: Number(pathItem.distance ?? route?.distance ?? 0),
+      durationSeconds: Number(cost?.duration ?? pathItem.duration ?? 0),
+      tolls: Number(cost?.tolls ?? 0),
+    } : null,
+  }
+  writeAuditLog({ category: 'tool', action: 'amap.trip-plan', summary: `高德行程查询成功：${origin} → ${destination}`, metadata: { hasWeather: Boolean(result.weather), hasRoute: Boolean(result.route) } })
+  return result
+}
+
+async function exportTripCard(value: unknown) {
+  const card = value as { title?: unknown; content?: unknown }
+  const title = String(card.title ?? '出差规划').slice(0, 120)
+  const content = String(card.content ?? '').slice(0, 30_000)
+  const result = await dialog.showSaveDialog({
+    title: '导出行程卡', defaultPath: `${title.replace(/[\\/:*?"<>|]/g, '-')}.md`,
+    filters: [{ name: 'Markdown', extensions: ['md'] }, { name: '文本', extensions: ['txt'] }],
+  })
+  if (result.canceled || !result.filePath) return { exported: false }
+  fs.writeFileSync(result.filePath, `# ${title}\n\n${content}\n`, 'utf8')
+  return { exported: true, path: result.filePath }
 }
 
 function createMainWindow() {
@@ -2308,6 +2489,9 @@ ipcMain.handle('tool:invoke-custom', async (_event, toolId: string, input: strin
     throw error
   }
 })
+
+ipcMain.handle('trip:plan-amap', (_event, draft: unknown) => planTripWithAmap(draft))
+ipcMain.handle('trip:export-card', (_event, card: unknown) => exportTripCard(card))
 
 ipcMain.handle('file:pick-text', async () => {
   const result = await dialog.showOpenDialog({

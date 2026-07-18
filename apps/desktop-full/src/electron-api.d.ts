@@ -32,6 +32,9 @@ type RagConfig = {
   embeddingProviderId: string
   embeddingModel: string
   embeddingBaseUrl: string
+  rerankerEnabled: boolean
+  rerankerModel: string
+  rerankerBaseUrl: string
   topK: number
 }
 
@@ -51,6 +54,12 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
+  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyName?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  retries?: number
+  version?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -61,11 +70,20 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  deletedBuiltinToolIds?: string[]
 }
 
 type CustomToolResult = {
   name: string
   content: string
+}
+
+type TripApiResult = {
+  origin: string
+  destination: string
+  dateText: string
+  weather: null | { date: string; dayWeather: string; nightWeather: string; dayTemp: string; nightTemp: string; dayWind: string }
+  route: null | { distanceMeters: number; durationSeconds: number; tolls: number }
 }
 
 type PlanStatus = 'active' | 'done'
@@ -114,7 +132,7 @@ type ButlerWorkspaceData = {
 type AgentRunSnapshot = {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'blocked' | 'failed'
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
   turns: number
   startedAt: number
   finishedAt?: number
@@ -247,6 +265,8 @@ declare global {
       getExtensionsPath: () => Promise<string>
       openExtensionsFolder: () => Promise<string>
       invokeCustomTool: (toolId: string, input: string) => Promise<CustomToolResult>
+      planTripWithAmap: (draft: { origin: string; destination: string; dateText: string }) => Promise<TripApiResult>
+      exportTripCard: (card: { title: string; content: string }) => Promise<{ exported: boolean; path?: string }>
     }
   }
 }
