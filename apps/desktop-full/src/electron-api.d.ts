@@ -27,6 +27,14 @@ type ModelProviderConfig = {
   baseUrl?: string
 }
 
+type RagConfig = {
+  embeddingEnabled: boolean
+  embeddingProviderId: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  topK: number
+}
+
 type CustomSkillConfig = {
   id: string
   name: string
@@ -52,6 +60,7 @@ type AgentPlatformConfig = {
   providers: ModelProviderConfig[]
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
+  rag: RagConfig
 }
 
 type CustomToolResult = {
@@ -153,6 +162,9 @@ type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+  lexicalScore: number
+  semanticScore: number
+  retrievalMode: 'keyword' | 'hybrid'
 }
 
 type KnowledgeDocumentSummary = {
@@ -162,6 +174,7 @@ type KnowledgeDocumentSummary = {
   updatedAt: number
   chunkCount: number
   characterCount: number
+  embeddingCount: number
 }
 
 type MemoryNote = {
@@ -212,6 +225,7 @@ declare global {
         document: KnowledgeDocumentInput,
       ) => Promise<{ id: string; name: string; createdAt: number; chunkCount: number }>
       searchKnowledge: (query: string, limit?: number) => Promise<KnowledgeSearchResult[]>
+      rebuildKnowledgeEmbeddings: () => Promise<{ documents: number; embeddings: number; model: string }>
       deleteKnowledgeDocument: (documentId: string) => Promise<{ deleted: boolean; id: string }>
       getMemoryNotes: () => Promise<MemoryNote[]>
       syncMemoryNotes: (notes: string[]) => Promise<MemoryNote[]>

@@ -35,7 +35,7 @@ import type { AssistantStatus, Message } from './type'
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
-type SettingsPage = 'home' | 'provider' | 'skill' | 'tool' | 'installed' | 'data'
+type SettingsPage = 'home' | 'provider' | 'rag' | 'skill' | 'tool' | 'installed' | 'data'
 type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
@@ -56,6 +56,14 @@ type ModelProviderConfig = {
   model: string
   apiKey?: string
   baseUrl?: string
+}
+
+type RagConfig = {
+  embeddingEnabled: boolean
+  embeddingProviderId: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  topK: number
 }
 
 type CustomSkillConfig = {
@@ -83,6 +91,7 @@ type AgentPlatformConfig = {
   providers: ModelProviderConfig[]
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
+  rag: RagConfig
 }
 
 type LocalTextFile = {
@@ -481,6 +490,7 @@ function App() {
   const [voiceEnabled, setVoiceEnabled] = useState(false)
   const [alwaysOnTop, setAlwaysOnTop] = useState(false)
   const [platformConfig, setPlatformConfig] = useState<AgentPlatformConfig | null>(null)
+  const [ragStatus, setRagStatus] = useState('')
   const [workflowData, setWorkflowData] = useState<ButlerWorkspaceData>({
     reports: [],
     plans: [],
@@ -1710,7 +1720,7 @@ ${fileContext}`,
   async function searchKnowledgeIndex() {
     const query = knowledgeQuery.trim()
     if (!isElectronReady || !query) return
-    setKnowledgeResults(await window.electronAPI.searchKnowledge(query, 8))
+    setKnowledgeResults(await window.electronAPI.searchKnowledge(query, platformConfig?.rag.topK ?? 5))
   }
 
   async function removeKnowledgeDocument(document: KnowledgeDocumentSummary) {
@@ -1845,6 +1855,26 @@ ${fileContext}`,
       ...platformConfig,
       activeProviderId: providerId,
     })
+  }
+
+  async function saveRagSettings() {
+    if (!platformConfig || !isElectronReady) return
+    setRagStatus('正在保存 RAG 配置...')
+    await savePlatformConfig(platformConfig)
+    setRagStatus(platformConfig.rag.embeddingEnabled ? '配置已保存，可以重建向量索引。' : '已保存，当前使用 BM25 关键词检索。')
+  }
+
+  async function rebuildRagIndex() {
+    if (!platformConfig || !isElectronReady) return
+    setRagStatus('正在生成 Embedding，请稍候...')
+    try {
+      await savePlatformConfig(platformConfig)
+      const result = await window.electronAPI.rebuildKnowledgeEmbeddings()
+      setKnowledgeIndex(await window.electronAPI.getKnowledgeDocuments())
+      setRagStatus(`完成：${result.documents} 份资料，${result.embeddings} 个向量，模型 ${result.model}。`)
+    } catch {
+      setRagStatus('向量索引失败，请检查 Provider API Key、Embedding URL 和模型名称。')
+    }
   }
 
   async function addModelProvider() {
@@ -3120,6 +3150,13 @@ ${result.content}
                   </span>
                   <b>{activeProvider?.name ?? '未加载'}</b>
                 </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('rag')}>
+                  <span>
+                    <strong>RAG 检索引擎</strong>
+                    <small>Embedding、混合检索、重排和上下文压缩。</small>
+                  </span>
+                  <b>{platformConfig?.rag.embeddingEnabled ? '混合检索' : 'BM25'}</b>
+                </button>
                 <button className="settings-entry" onClick={() => setSettingsPage('skill')}>
                   <span>
                     <strong>安装 Prompt Skill</strong>
@@ -3224,6 +3261,76 @@ ${result.content}
                     onChange={(event) => setProviderForm({ ...providerForm, apiKey: event.target.value })}
                   />
                   <button onClick={addModelProvider}>添加并启用 Provider</button>
+                </div>
+              </div>
+            )}
+
+            {settingsPage === 'rag' && platformConfig && (
+              <div className="settings-block">
+                <h3>RAG 检索引擎</h3>
+                <p className="settings-help">
+                  BM25 始终在本地可用。启用 Embedding 后，系统会并行执行关键词与向量检索，再进行混合评分、重排和上下文压缩。
+                </p>
+                <label className="settings-row">
+                  <span>启用 Embedding 向量检索</span>
+                  <input
+                    type="checkbox"
+                    checked={platformConfig.rag.embeddingEnabled}
+                    onChange={(event) => setPlatformConfig({
+                      ...platformConfig,
+                      rag: { ...platformConfig.rag, embeddingEnabled: event.target.checked },
+                    })}
+                  />
+                </label>
+                <div className="settings-form">
+                  <label>
+                    Embedding 使用的 Provider
+                    <select
+                      value={platformConfig.rag.embeddingProviderId}
+                      onChange={(event) => setPlatformConfig({
+                        ...platformConfig,
+                        rag: { ...platformConfig.rag, embeddingProviderId: event.target.value },
+                      })}
+                    >
+                      {platformConfig.providers.filter((provider) => provider.type !== 'mock').map((provider) => (
+                        <option key={provider.id} value={provider.id}>{provider.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <input
+                    value={platformConfig.rag.embeddingModel}
+                    placeholder="Embedding 模型，例如 embedding-3"
+                    onChange={(event) => setPlatformConfig({
+                      ...platformConfig,
+                      rag: { ...platformConfig.rag, embeddingModel: event.target.value },
+                    })}
+                  />
+                  <input
+                    value={platformConfig.rag.embeddingBaseUrl}
+                    placeholder="兼容 /embeddings 的完整 URL"
+                    onChange={(event) => setPlatformConfig({
+                      ...platformConfig,
+                      rag: { ...platformConfig.rag, embeddingBaseUrl: event.target.value },
+                    })}
+                  />
+                  <label>
+                    最终交给大模型的片段数：{platformConfig.rag.topK}
+                    <input
+                      type="range"
+                      min="1"
+                      max="10"
+                      value={platformConfig.rag.topK}
+                      onChange={(event) => setPlatformConfig({
+                        ...platformConfig,
+                        rag: { ...platformConfig.rag, topK: Number(event.target.value) },
+                      })}
+                    />
+                  </label>
+                  <button onClick={saveRagSettings}>保存 RAG 配置</button>
+                  <button onClick={rebuildRagIndex} disabled={!platformConfig.rag.embeddingEnabled || isThinking}>
+                    重建全部向量索引
+                  </button>
+                  {ragStatus && <p className="settings-help">{ragStatus}</p>}
                 </div>
               </div>
             )}

@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getKnowledgeDocuments: () => ipcRenderer.invoke('knowledge:list'),
   upsertKnowledgeDocument: (document: unknown) => ipcRenderer.invoke('knowledge:upsert', document),
   searchKnowledge: (query: string, limit = 6) => ipcRenderer.invoke('knowledge:search', query, limit),
+  rebuildKnowledgeEmbeddings: () => ipcRenderer.invoke('knowledge:rebuild-embeddings'),
   deleteKnowledgeDocument: (documentId: string) => ipcRenderer.invoke('knowledge:delete', documentId),
   getMemoryNotes: () => ipcRenderer.invoke('memory:list'),
   syncMemoryNotes: (notes: unknown) => ipcRenderer.invoke('memory:sync', notes),

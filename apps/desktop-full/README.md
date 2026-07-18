@@ -35,7 +35,7 @@
 - React 渲染层通过 preload + IPC 调用白名单 API
 - Agent Loop：目标理解、工具规划、工具调用、观察结果、最终回复
 - 本地文件读取与总结
-- RAG 本地资料库
+- 混合 RAG 本地资料库：智能切块、SQLite FTS5/BM25、Embedding 向量、混合评分、本地重排、上下文压缩与来源引用
 - Skill Registry：项目讲解、开发日报、排错清单、README 生成
 - 用户安装 Prompt Skill 与 HTTP API Tool
 - 工具调用权限确认与日志可观测
@@ -117,6 +117,12 @@ ZHIPU_API_KEY=你的智谱APIKey
 ```
 
 也可以在开发者版设置中添加新的模型 Provider、Prompt Skill 和 HTTP API Tool。
+
+### 混合 RAG
+
+未配置 Embedding 时，资料库使用本地 SQLite FTS5 + BM25 检索。进入“设置 → RAG 检索引擎”后，可以选择一个已配置 API Key 的 Provider，填写兼容 OpenAI `/embeddings` 结构的完整接口地址和模型名称，然后重建向量索引。
+
+向量使用 Float32 BLOB 保存在本地 SQLite。查询时系统并行执行 BM25 与余弦相似度检索，合并候选片段后进行混合评分、本地重排和句子级上下文压缩，默认只把前 5 个带来源片段交给大模型。Embedding 请求失败时会自动降级为 BM25，不影响原有知识库。
 
 ## 本地扩展目录
 

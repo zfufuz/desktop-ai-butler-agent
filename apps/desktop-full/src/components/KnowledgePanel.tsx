@@ -5,6 +5,7 @@ export type KnowledgeDocumentSummary = {
   updatedAt: number
   chunkCount: number
   characterCount: number
+  embeddingCount: number
 }
 
 export type KnowledgeSearchResult = {
@@ -13,6 +14,9 @@ export type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+  lexicalScore: number
+  semanticScore: number
+  retrievalMode: 'keyword' | 'hybrid'
 }
 
 type KnowledgePanelProps = {
@@ -57,8 +61,11 @@ function KnowledgePanel({
           <strong>命中片段</strong>
           {results.map((result) => (
             <details key={`${result.documentId}-${result.chunkIndex}`}>
-              <summary>{result.documentName} · 片段 {result.chunkIndex + 1}</summary>
+              <summary>
+                {result.documentName} · 片段 {result.chunkIndex + 1} · {result.retrievalMode === 'hybrid' ? '混合检索' : 'BM25'}
+              </summary>
               <p>{result.content}</p>
+              <small>综合 {result.score.toFixed(3)} · 关键词 {result.lexicalScore.toFixed(3)} · 语义 {result.semanticScore.toFixed(3)}</small>
             </details>
           ))}
         </div>
@@ -68,7 +75,9 @@ function KnowledgePanel({
           <div className="knowledge-item" key={document.id}>
             <span>
               <strong>{document.name}</strong>
-              <small>{document.chunkCount} 个片段 · {document.characterCount.toLocaleString('zh-CN')} 字符</small>
+              <small>
+                {document.chunkCount} 个片段 · {document.embeddingCount ?? 0} 个向量 · {document.characterCount.toLocaleString('zh-CN')} 字符
+              </small>
             </span>
             <button onClick={() => onRemove(document)}>删除</button>
           </div>

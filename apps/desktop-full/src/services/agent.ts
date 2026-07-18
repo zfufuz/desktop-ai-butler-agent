@@ -242,10 +242,10 @@ async function executeTool(
 
   if (call.name === 'queryKnowledgeBase') {
     const query = String(call.input.query ?? userText)
-    let results = await window.electronAPI.searchKnowledge(query, 6)
+    let results = await window.electronAPI.searchKnowledge(query, 5)
     if (results.length === 0 && options.knowledgeDocuments.length > 0) {
       await window.electronAPI.syncKnowledgeDocuments(options.knowledgeDocuments)
-      results = await window.electronAPI.searchKnowledge(query, 6)
+      results = await window.electronAPI.searchKnowledge(query, 5)
     }
     if (results.length === 0) return fail('知识库没有检索到相关片段')
 
@@ -253,7 +253,7 @@ async function executeTool(
     const context = results
       .map(
         (result, index) =>
-          `[${index + 1}] 来源：${result.documentName}，片段 ${result.chunkIndex + 1}\n${result.content}`,
+          `[${index + 1}] 来源：${result.documentName}，片段 ${result.chunkIndex + 1}，检索：${result.retrievalMode === 'hybrid' ? 'BM25 + 向量混合' : 'BM25'}\n${result.content}`,
       )
       .join('\n\n')
     return succeed(

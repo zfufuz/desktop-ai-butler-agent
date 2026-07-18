@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
 import { readXlsxFile } from './excel-parser.js'
+import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -23,6 +24,14 @@ type ModelProviderConfig = {
   model: string
   apiKey?: string
   baseUrl?: string
+}
+
+type RagConfig = {
+  embeddingEnabled: boolean
+  embeddingProviderId: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  topK: number
 }
 
 type CustomSkillConfig = {
@@ -119,6 +128,9 @@ type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+  lexicalScore: number
+  semanticScore: number
+  retrievalMode: 'keyword' | 'hybrid'
 }
 
 type AuditLogLevel = 'info' | 'warn' | 'error'
@@ -150,6 +162,7 @@ type AgentPlatformConfig = {
   providers: ModelProviderConfig[]
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
+  rag: RagConfig
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -554,6 +567,10 @@ function initializeDatabase() {
       document_name TEXT NOT NULL,
       chunk_index INTEGER NOT NULL,
       content TEXT NOT NULL,
+      embedding_blob BLOB,
+      embedding_dimensions INTEGER,
+      embedding_model TEXT,
+      embedding_updated_at INTEGER,
       FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);
@@ -569,6 +586,18 @@ function initializeDatabase() {
   const planColumns = new Set(
     (database.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>).map((column) => column.name),
   )
+  const knowledgeChunkColumns = new Set(
+    (database.prepare('PRAGMA table_info(knowledge_chunks)').all() as Array<{ name: string }>).map((column) => column.name),
+  )
+  const knowledgeChunkMigrations = [
+    ['embedding_blob', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_blob BLOB'],
+    ['embedding_dimensions', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_dimensions INTEGER'],
+    ['embedding_model', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_model TEXT'],
+    ['embedding_updated_at', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_updated_at INTEGER'],
+  ] as const
+  for (const [column, migration] of knowledgeChunkMigrations) {
+    if (!knowledgeChunkColumns.has(column)) database.exec(migration)
+  }
   const planMigrations = [
     ['priority', "ALTER TABLE plans ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"],
     ['due_date', 'ALTER TABLE plans ADD COLUMN due_date TEXT'],
@@ -881,7 +910,67 @@ function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
   }
 }
 
-function upsertKnowledgeDocument(value: unknown) {
+function getEmbeddingRuntime() {
+  const config = readPlatformConfig()
+  if (!config.rag.embeddingEnabled) return null
+  const provider = config.providers.find((item) => item.id === config.rag.embeddingProviderId)
+  if (!provider?.apiKey || provider.type === 'mock') return null
+  return {
+    provider,
+    model: config.rag.embeddingModel.trim(),
+    endpoint: config.rag.embeddingBaseUrl.trim(),
+  }
+}
+
+async function requestEmbeddingVectors(texts: string[]) {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime || texts.length === 0) return null
+  const endpoint = validateHttpEndpoint(runtime.endpoint, 'Embedding Provider')
+  const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(60_000),
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${runtime.provider.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ model: runtime.model, input: texts }),
+  })
+  if (!response.ok) {
+    throw new Error(`Embedding provider request failed: ${response.status}`)
+  }
+  const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
+  const ordered = [...(payload.data ?? [])].sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+  const vectors = ordered.map((item) => item.embedding).filter((item): item is number[] => Array.isArray(item))
+  if (vectors.length !== texts.length || vectors.some((vector) => vector.length === 0)) {
+    throw new Error('Embedding provider returned an invalid vector count')
+  }
+  return { vectors, model: runtime.model }
+}
+
+async function indexDocumentEmbeddings(documentId: string, chunks: string[]) {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime || chunks.length === 0) return 0
+  const db = initializeDatabase()
+  let indexed = 0
+  for (let start = 0; start < chunks.length; start += 32) {
+    const batch = chunks.slice(start, start + 32)
+    const result = await requestEmbeddingVectors(batch)
+    if (!result) break
+    const update = db.prepare(
+      `UPDATE knowledge_chunks
+       SET embedding_blob = ?, embedding_dimensions = ?, embedding_model = ?, embedding_updated_at = ?
+       WHERE document_id = ? AND chunk_index = ?`,
+    )
+    result.vectors.forEach((vector, offset) => {
+      const blob = Buffer.from(encodeEmbeddingVector(vector))
+      update.run(blob, vector.length, result.model, Date.now(), documentId, start + offset)
+      indexed += 1
+    })
+  }
+  return indexed
+}
+
+async function upsertKnowledgeDocument(value: unknown) {
   const document = normalizeKnowledgeDocument(value)
   const documentId = String(document.id)
   const chunks = chunkKnowledgeContent(document.content)
@@ -911,13 +1000,21 @@ function upsertKnowledgeDocument(value: unknown) {
     writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料入库失败：${document.name}`, detail: error, status: 'failure' })
     throw error
   }
-  writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料已入库：${document.name}`, metadata: { documentId, chunks: chunks.length, characters: document.content.length } })
-  return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length }
+  let embeddingCount = 0
+  try {
+    embeddingCount = await indexDocumentEmbeddings(documentId, chunks)
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.embedding', summary: `向量索引失败，已保留关键词索引：${document.name}`, detail: error, status: 'failure', level: 'warn', metadata: { documentId, chunks: chunks.length } })
+  }
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料已入库：${document.name}`, metadata: { documentId, chunks: chunks.length, embeddings: embeddingCount, characters: document.content.length } })
+  return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length, embeddingCount }
 }
 
-function syncKnowledgeDocuments(values: unknown) {
+async function syncKnowledgeDocuments(values: unknown) {
   if (!Array.isArray(values)) return []
-  return values.slice(0, 50).map(upsertKnowledgeDocument)
+  const results = []
+  for (const value of values.slice(0, 50)) results.push(await upsertKnowledgeDocument(value))
+  return results
 }
 
 function listKnowledgeDocuments() {
@@ -925,13 +1022,31 @@ function listKnowledgeDocuments() {
     .prepare(
       `SELECT documents.id, documents.name, documents.created_at AS createdAt,
         documents.updated_at AS updatedAt, COUNT(chunks.id) AS chunkCount,
-        LENGTH(documents.content) AS characterCount
+        LENGTH(documents.content) AS characterCount,
+        SUM(CASE WHEN chunks.embedding_blob IS NOT NULL THEN 1 ELSE 0 END) AS embeddingCount
       FROM knowledge_documents AS documents
       LEFT JOIN knowledge_chunks AS chunks ON chunks.document_id = documents.id
       GROUP BY documents.id
       ORDER BY documents.updated_at DESC`,
     )
     .all()
+}
+
+async function rebuildKnowledgeEmbeddings() {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime) throw new Error('请先启用 Embedding 并选择一个带 API Key 的 Provider')
+  const rows = initializeDatabase()
+    .prepare('SELECT DISTINCT document_id AS documentId FROM knowledge_chunks ORDER BY document_id')
+    .all() as Array<{ documentId: string }>
+  let indexed = 0
+  for (const row of rows) {
+    const chunks = initializeDatabase()
+      .prepare('SELECT content FROM knowledge_chunks WHERE document_id = ? ORDER BY chunk_index')
+      .all(row.documentId) as Array<{ content: string }>
+    indexed += await indexDocumentEmbeddings(row.documentId, chunks.map((chunk) => chunk.content))
+  }
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.rebuild-embeddings', summary: `向量索引重建完成：${indexed} 个片段`, metadata: { documents: rows.length, embeddings: indexed, model: runtime.model } })
+  return { documents: rows.length, embeddings: indexed, model: runtime.model }
 }
 
 function deleteKnowledgeDocument(documentId: string) {
@@ -951,15 +1066,18 @@ function deleteKnowledgeDocument(documentId: string) {
   }
 }
 
-function searchKnowledge(query: string, requestedLimit = 6): KnowledgeSearchResult[] {
+async function searchKnowledge(query: string, requestedLimit = 5): Promise<KnowledgeSearchResult[]> {
   const terms = createKnowledgeSearchTerms(query)
   if (terms.length === 0) return []
-  const limit = Math.max(1, Math.min(Number(requestedLimit) || 6, 12))
+  const configuredLimit = readPlatformConfig().rag.topK
+  const limit = Math.max(1, Math.min(Number(requestedLimit) || configuredLimit, 10))
+  const candidateLimit = Math.max(20, limit * 6)
   const db = initializeDatabase()
   const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
+  let lexicalRows: Array<Omit<KnowledgeSearchResult, 'score' | 'lexicalScore' | 'semanticScore' | 'retrievalMode'> & { rank?: number }> = []
 
   try {
-    const rows = db
+    lexicalRows = db
       .prepare(
         `SELECT document_id AS documentId, document_name AS documentName,
           CAST(chunk_index AS INTEGER) AS chunkIndex, content,
@@ -968,24 +1086,67 @@ function searchKnowledge(query: string, requestedLimit = 6): KnowledgeSearchResu
         WHERE knowledge_chunks_fts MATCH ?
         ORDER BY rank ASC LIMIT ?`,
       )
-      .all(ftsQuery, limit) as Array<KnowledgeSearchResult & { rank: number }>
-    if (rows.length > 0) {
-      return rows.map(({ rank, ...row }) => ({ ...row, score: Number((-rank).toFixed(6)) }))
-    }
+      .all(ftsQuery, candidateLimit) as typeof lexicalRows
   } catch {
     // Fall back to LIKE search when a platform FTS tokenizer cannot parse a query.
   }
 
-  const fallbackTerms = terms.slice(0, 8)
-  const where = fallbackTerms.map(() => 'content LIKE ?').join(' OR ')
-  const rows = db
-    .prepare(
-      `SELECT document_id AS documentId, document_name AS documentName,
-        chunk_index AS chunkIndex, content
-      FROM knowledge_chunks WHERE ${where} LIMIT ?`,
-    )
-    .all(...fallbackTerms.map((term) => `%${term}%`), limit) as Array<Omit<KnowledgeSearchResult, 'score'>>
-  return rows.map((row) => ({ ...row, score: 0 }))
+  if (lexicalRows.length === 0) {
+    const fallbackTerms = terms.slice(0, 8)
+    const where = fallbackTerms.map(() => 'content LIKE ?').join(' OR ')
+    lexicalRows = db
+      .prepare(
+        `SELECT document_id AS documentId, document_name AS documentName,
+          chunk_index AS chunkIndex, content
+        FROM knowledge_chunks WHERE ${where} LIMIT ?`,
+      )
+      .all(...fallbackTerms.map((term) => `%${term}%`), candidateLimit) as typeof lexicalRows
+  }
+
+  const candidates = new Map<string, HybridCandidate>()
+  lexicalRows.forEach((row, lexicalRank) => {
+    const key = `${row.documentId}:${row.chunkIndex}`
+    candidates.set(key, { ...row, lexicalRank })
+  })
+
+  try {
+    const queryEmbedding = await requestEmbeddingVectors([query])
+    if (queryEmbedding) {
+      const vectorRows = db
+        .prepare(
+          `SELECT document_id AS documentId, document_name AS documentName,
+            chunk_index AS chunkIndex, content, embedding_blob AS embeddingBlob,
+            embedding_dimensions AS embeddingDimensions
+           FROM knowledge_chunks
+           WHERE embedding_blob IS NOT NULL AND embedding_model = ?`,
+        )
+        .all(queryEmbedding.model) as Array<Omit<HybridCandidate, 'vectorScore'> & { embeddingBlob: Uint8Array; embeddingDimensions: number }>
+      const rankedVectors = vectorRows
+        .map((row) => {
+          const vector = decodeEmbeddingVector(row.embeddingBlob, row.embeddingDimensions)
+          return { ...row, vectorScore: cosineSimilarity(queryEmbedding.vectors[0], vector) }
+        })
+        .sort((left, right) => right.vectorScore - left.vectorScore)
+        .slice(0, candidateLimit)
+      rankedVectors.forEach(({ embeddingBlob: _embeddingBlob, embeddingDimensions: _embeddingDimensions, ...row }, vectorRank) => {
+        const key = `${row.documentId}:${row.chunkIndex}`
+        candidates.set(key, { ...(candidates.get(key) ?? row), vectorRank, vectorScore: row.vectorScore })
+      })
+    }
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.vector-search', summary: '向量检索失败，已降级为 BM25', detail: error, status: 'failure', level: 'warn' })
+  }
+
+  return rerankHybridCandidates([...candidates.values()], terms, limit).map((result) => ({
+    documentId: result.documentId,
+    documentName: result.documentName,
+    chunkIndex: result.chunkIndex,
+    content: compressKnowledgeContext(result.content, terms),
+    score: result.score,
+    lexicalScore: result.lexicalScore,
+    semanticScore: result.semanticScore,
+    retrievalMode: result.retrievalMode,
+  }))
 }
 
 function createId(prefix: string) {
@@ -1410,6 +1571,13 @@ function createDefaultConfig(): AgentPlatformConfig {
     providers,
     customSkills: [],
     customTools: [],
+    rag: {
+      embeddingEnabled: false,
+      embeddingProviderId: 'zhipu-default',
+      embeddingModel: 'embedding-3',
+      embeddingBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/embeddings',
+      topK: 5,
+    },
   }
 }
 
@@ -1446,6 +1614,11 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
       ...(savedConfig.customTools ?? []).filter((tool) => !tool.id.startsWith('extension:')),
       ...extensionConfig.customTools,
     ],
+    rag: {
+      ...defaultConfig.rag,
+      ...(savedConfig.rag ?? {}),
+      topK: Math.max(1, Math.min(Number(savedConfig.rag?.topK) || defaultConfig.rag.topK, 10)),
+    },
   }
 }
 
@@ -1897,23 +2070,27 @@ ipcMain.handle('data:open-folder', async () => {
   return dataPath
 })
 
-ipcMain.handle('knowledge:sync', (_event, documents: unknown) => {
-  return syncKnowledgeDocuments(documents)
+ipcMain.handle('knowledge:sync', async (_event, documents: unknown) => {
+  return await syncKnowledgeDocuments(documents)
 })
 
 ipcMain.handle('knowledge:list', () => {
   return listKnowledgeDocuments()
 })
 
-ipcMain.handle('knowledge:upsert', (_event, document: unknown) => {
-  return upsertKnowledgeDocument(document)
+ipcMain.handle('knowledge:upsert', async (_event, document: unknown) => {
+  return await upsertKnowledgeDocument(document)
 })
 
-ipcMain.handle('knowledge:search', (_event, query: string, limit?: number) => {
+ipcMain.handle('knowledge:search', async (_event, query: string, limit?: number) => {
   const safeQuery = typeof query === 'string' ? query.slice(0, 1000) : ''
-  const results = searchKnowledge(safeQuery, limit)
-  writeAuditLog({ category: 'knowledge', action: 'knowledge.search', summary: `资料库检索命中 ${results.length} 个片段`, status: results.length > 0 ? 'success' : 'failure', level: results.length > 0 ? 'info' : 'warn', metadata: { queryLength: safeQuery.length, results: results.length, sources: [...new Set(results.map((item) => item.documentName))].join(', ') } })
+  const results = await searchKnowledge(safeQuery, limit)
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.search', summary: `资料库检索命中 ${results.length} 个片段`, status: results.length > 0 ? 'success' : 'failure', level: results.length > 0 ? 'info' : 'warn', metadata: { queryLength: safeQuery.length, results: results.length, mode: results.some((item) => item.retrievalMode === 'hybrid') ? 'hybrid' : 'keyword', sources: [...new Set(results.map((item) => item.documentName))].join(', ') } })
   return results
+})
+
+ipcMain.handle('knowledge:rebuild-embeddings', async () => {
+  return await rebuildKnowledgeEmbeddings()
 })
 
 ipcMain.handle('knowledge:delete', (_event, documentId: string) => {
