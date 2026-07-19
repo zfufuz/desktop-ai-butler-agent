@@ -1,13 +1,16 @@
-import { app, BrowserWindow, Notification, Tray, dialog, globalShortcut, ipcMain, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, Notification, Tray, dialog, globalShortcut, ipcMain, safeStorage, screen, shell } from 'electron'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
+import mammoth from 'mammoth'
+import { PDFParse } from 'pdf-parse'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
 import { readXlsxFile } from './excel-parser.js'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
+import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -53,12 +56,16 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
-  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyPlacement?: 'none' | 'bearer' | 'query' | 'header'
   apiKeyName?: string
   headers?: Record<string, string>
   timeoutMs?: number
   retries?: number
   version?: string
+  inputSchema?: ToolInputSchema
+  queryParams?: ToolRequestMapping
+  bodyParams?: ToolRequestMapping
+  responsePath?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -172,11 +179,21 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  integrations: {
+    amapApiKey?: string
+  }
   deletedBuiltinToolIds?: string[]
 }
 
 let mainWindow: BrowserWindow | null = null
 let floatingReportWindow: BrowserWindow | null = null
+let floatingReportDock: 'left' | 'right' = 'right'
+let floatingReportHidden = false
+let floatingReportMoving = false
+let floatingReportHideTimer: ReturnType<typeof setTimeout> | null = null
+let floatingReportCursorMonitor: ReturnType<typeof setInterval> | null = null
+let floatingReportLastHoverAt = 0
+const toolCircuitStates = new Map<string, { failures: number; openUntil: number }>()
 let tray: Tray | null = null
 let database: DatabaseSync | null = null
 
@@ -292,10 +309,9 @@ function readZipEntries(filePath: string) {
   return entries
 }
 
-function readDocxFile(filePath: string) {
-  const entries = readZipEntries(filePath)
-  const documentXml = entries.get('word/document.xml')?.toString('utf8') ?? ''
-  return stripXmlTags(documentXml)
+async function readDocxFile(filePath: string) {
+  const result = await mammoth.extractRawText({ path: filePath })
+  return result.value.trim() || 'DOCX 中没有可提取的正文文本。'
 }
 
 function readPptxFile(filePath: string) {
@@ -307,19 +323,15 @@ function readPptxFile(filePath: string) {
     .join('\n\n')
 }
 
-function readPdfFile(filePath: string) {
-  const raw = fs.readFileSync(filePath).toString('latin1')
-  const literalTexts = [...raw.matchAll(/\(([^()]{2,500})\)\s*Tj/g)].map((match) => match[1])
-  const arrayTexts = [...raw.matchAll(/\[((?:\([^()]{1,200}\)\s*)+)\]\s*TJ/g)].map((match) =>
-    [...match[1].matchAll(/\(([^()]{1,200})\)/g)].map((textMatch) => textMatch[1]).join(''),
-  )
-  const text = [...literalTexts, ...arrayTexts]
-    .join('\n')
-    .replace(/\\([()\\])/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return text || '已识别为 PDF 文件，但当前内置解析器没有抽取到可读文本。扫描版 PDF 需要后续接 OCR 或专业 PDF 解析库。'
+async function readPdfFile(filePath: string) {
+  const parser = new PDFParse({ data: fs.readFileSync(filePath) })
+  try {
+    const result = await parser.getText()
+    const text = result.text.trim()
+    return text || 'PDF 中没有文本层；这通常是扫描件，需要配置 OCR Tool 后才能识别。'
+  } finally {
+    await parser.destroy()
+  }
 }
 
 function readImageInfo(filePath: string) {
@@ -357,13 +369,13 @@ async function readSupportedFile(filePath: string): Promise<PickedTextFile> {
   if (plainTextExtensions.has(extension)) {
     content = fs.readFileSync(filePath, 'utf8')
   } else if (extension === '.docx') {
-    content = readDocxFile(filePath)
+    content = await readDocxFile(filePath)
   } else if (extension === '.xlsx') {
     content = await readXlsxFile(filePath)
   } else if (extension === '.pptx') {
     content = readPptxFile(filePath)
   } else if (extension === '.pdf') {
-    content = readPdfFile(filePath)
+    content = await readPdfFile(filePath)
   } else if (imageExtensions.has(extension)) {
     content = readImageInfo(filePath)
   } else {
@@ -1441,26 +1453,149 @@ function appendActivity(data: ButlerWorkspaceData, activity: Omit<ButlerActivity
   ].slice(0, 80)
 }
 
-function openFloatingReport(report: ButlerReport) {
+const FLOATING_REPORT_WIDTH = 336
+const FLOATING_REPORT_HEIGHT = 326
+const FLOATING_REPORT_MARGIN = 12
+const FLOATING_REPORT_HANDLE = 28
+
+function clearFloatingReportHideTimer() {
+  if (floatingReportHideTimer) clearTimeout(floatingReportHideTimer)
+  floatingReportHideTimer = null
+}
+
+function getFloatingReportBounds(hidden: boolean) {
+  if (!floatingReportWindow) return null
+  const bounds = floatingReportWindow.getBounds()
+  const workArea = screen.getDisplayMatching(bounds).workArea
+  const y = Math.max(workArea.y + FLOATING_REPORT_MARGIN, Math.min(bounds.y, workArea.y + workArea.height - bounds.height - FLOATING_REPORT_MARGIN))
+  const width = hidden ? FLOATING_REPORT_HANDLE : FLOATING_REPORT_WIDTH
+  const x = floatingReportDock === 'right'
+    ? workArea.x + workArea.width - width
+    : workArea.x
+  return { x, y, width, height: bounds.height }
+}
+
+function moveFloatingReport(hidden: boolean) {
+  if (!floatingReportWindow || floatingReportWindow.isDestroyed()) return
+  const bounds = getFloatingReportBounds(hidden)
+  if (!bounds) return
+  floatingReportMoving = true
+  floatingReportHidden = hidden
+  floatingReportWindow.setBounds(bounds, false)
+  void floatingReportWindow.webContents.executeJavaScript(`document.body.dataset.dock = '${floatingReportDock}'`)
+  setTimeout(() => { floatingReportMoving = false }, 120)
+}
+
+function scheduleFloatingReportHide(delay = 900) {
+  clearFloatingReportHideTimer()
+  floatingReportHideTimer = setTimeout(() => moveFloatingReport(true), delay)
+}
+
+function stopFloatingReportCursorMonitor() {
+  if (floatingReportCursorMonitor) clearInterval(floatingReportCursorMonitor)
+  floatingReportCursorMonitor = null
+}
+
+function startFloatingReportCursorMonitor() {
+  stopFloatingReportCursorMonitor()
+  floatingReportLastHoverAt = Date.now()
+  floatingReportCursorMonitor = setInterval(() => {
+    if (!floatingReportWindow || floatingReportWindow.isDestroyed()) {
+      stopFloatingReportCursorMonitor()
+      return
+    }
+    const point = screen.getCursorScreenPoint()
+    const bounds = floatingReportWindow.getBounds()
+    const inside = point.x >= bounds.x && point.x < bounds.x + bounds.width
+      && point.y >= bounds.y && point.y < bounds.y + bounds.height
+    if (inside) {
+      floatingReportLastHoverAt = Date.now()
+      clearFloatingReportHideTimer()
+      if (floatingReportHidden) expandFloatingReport()
+      return
+    }
+    if (!floatingReportHidden && Date.now() - floatingReportLastHoverAt > 1600) moveFloatingReport(true)
+  }, 160)
+}
+
+function expandFloatingReport() {
+  clearFloatingReportHideTimer()
+  moveFloatingReport(false)
+}
+
+function getFloatingReportActions(value: string) {
+  const candidates = value.split(/\r?\n/)
+    .map((line) => formatFloatingDisplayText(line.trim().replace(/^#{1,3}\s+/, '').replace(/^\d+[.、]\s*/, '').replace(/^[-*•]\s*/, '').replace(/\*\*/g, '')))
+    .filter((line) => line.length >= 5
+      && !/^(报告摘要|关键发现|风险提醒|下一步计划|今日可打卡事项|交通建议|住宿与预算建议)[:：]?$/.test(line)
+      && !/配置.*(?:Tool|工具)|未配置.*(?:Tool|工具)|API.*(?:错误|问题|失败)|无法确定.*(?:交通|天气)|ENGINE_RESPONSE|infocode/i.test(line))
+  const actionable = candidates.filter((line) => /建议|需要|准备|检查|确认|预订|联系|完成|下一步|提醒/.test(line))
+  const selected = [...actionable, ...candidates.filter((line) => !actionable.includes(line))]
+    .filter((line, index, lines) => lines.indexOf(line) === index)
+    .slice(0, 3)
+  return selected.map((line) => `<li>${escapeHtml(line.slice(0, 92))}${line.length > 92 ? '…' : ''}</li>`).join('')
+}
+
+function formatFloatingDisplayText(value: string) {
+  return value.replace(/\b(20\d{2})(\d{2})(\d{2})\b/g, '$1-$2-$3')
+}
+
+function openFloatingReport(report: ButlerReport, kind: 'report' | 'plan' = 'report', progress?: number) {
   floatingReportWindow?.close()
 
+  const workArea = screen.getPrimaryDisplay().workArea
+  floatingReportDock = 'right'
+  floatingReportHidden = false
+
   floatingReportWindow = new BrowserWindow({
-    title: `报告：${report.title}`,
-    width: 380,
-    height: 520,
-    minWidth: 320,
-    minHeight: 360,
+    title: report.title,
+    width: FLOATING_REPORT_WIDTH,
+    height: Math.min(FLOATING_REPORT_HEIGHT, workArea.height - 32),
+    x: workArea.x + workArea.width - FLOATING_REPORT_WIDTH,
+    y: workArea.y + 72,
     alwaysOnTop: true,
-    resizable: true,
-    frame: true,
+    skipTaskbar: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    backgroundColor: '#00000000',
     webPreferences: {
+      preload: path.join(__dirname, 'floating-report-preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
   })
 
+  floatingReportWindow.setAlwaysOnTop(true, 'floating')
+
+  floatingReportWindow.on('moved', () => {
+    if (!floatingReportWindow || floatingReportMoving || floatingReportHidden) return
+    const bounds = floatingReportWindow.getBounds()
+    const display = screen.getDisplayMatching(bounds)
+    const leftDistance = Math.abs(bounds.x - display.workArea.x)
+    const rightDistance = Math.abs(bounds.x + bounds.width - (display.workArea.x + display.workArea.width))
+    if (Math.min(leftDistance, rightDistance) <= 72) {
+      floatingReportDock = leftDistance < rightDistance ? 'left' : 'right'
+      expandFloatingReport()
+      scheduleFloatingReportHide(1800)
+    }
+  })
+
   floatingReportWindow.on('closed', () => {
+    clearFloatingReportHideTimer()
+    stopFloatingReportCursorMonitor()
     floatingReportWindow = null
+  })
+
+  floatingReportWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('butler-widget://')) return
+    event.preventDefault()
+    if (url.startsWith('butler-widget://collapse')) moveFloatingReport(true)
+    if (url.startsWith('butler-widget://close')) floatingReportWindow?.close()
   })
 
   const html = `<!doctype html>
@@ -1468,26 +1603,70 @@ function openFloatingReport(report: ButlerReport) {
   <head>
     <meta charset="UTF-8" />
     <style>
-      :root { color: #0f172a; background: #f8fafc; font-family: "Segoe UI", system-ui, sans-serif; }
+      :root { color: #17211f; background: transparent; font-family: "Segoe UI", system-ui, sans-serif; }
       * { box-sizing: border-box; }
-      body { margin: 0; padding: 18px; overflow: auto; }
-      .eyebrow { color: #0f766e; font-size: 11px; font-weight: 900; text-transform: uppercase; }
-      h1 { margin: 6px 0 10px; font-size: 20px; line-height: 1.25; }
-      .summary { margin: 0 0 14px; padding: 12px; border: 1px solid rgba(20, 184, 166, 0.24); border-radius: 8px; background: #ecfeff; line-height: 1.6; }
-      pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; font-family: inherit; }
-      footer { margin-top: 16px; color: #64748b; font-size: 12px; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+      body { padding: 8px; }
+      .edge-rail { position: fixed; z-index: 20; top: 54px; bottom: 54px; width: 10px; border-radius: 8px; background: #14b8a6; box-shadow: 0 8px 24px rgba(15,118,110,.32); }
+      .edge-rail.left { left: 1px; }
+      .edge-rail.right { right: 1px; }
+      body[data-dock="right"] .edge-rail.right, body[data-dock="left"] .edge-rail.left { display: none; }
+      .widget { height: 100%; overflow: hidden; border: 1px solid rgba(100,116,139,.22); border-radius: 14px; background: rgba(250,252,252,.98); box-shadow: 0 22px 56px rgba(15,23,42,.22); }
+      header { -webkit-app-region: drag; display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 54px; border-bottom: 1px solid rgba(148,163,184,.2); padding: 10px 12px 10px 16px; }
+      .identity { min-width: 0; display: flex; align-items: center; gap: 10px; }
+      .mark { width: 28px; height: 28px; display: grid; place-items: center; flex: none; border-radius: 8px; background: #0f766e; color: white; font-size: 13px; font-weight: 900; }
+      .identity div { min-width: 0; }
+      .eyebrow { color: #0f766e; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+      .title { overflow: hidden; color: #17211f; font-size: 13px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+      .window-actions { -webkit-app-region: no-drag; display: flex; gap: 5px; }
+      .window-actions button { width: 30px; height: 30px; border: 1px solid rgba(148,163,184,.25); border-radius: 8px; background: white; color: #475569; cursor: pointer; font-size: 17px; }
+      .window-actions button:hover { border-color: rgba(20,184,166,.5); color: #0f766e; }
+      main { height: calc(100% - 54px); overflow: hidden; padding: 14px 16px; }
+      .summary { display: -webkit-box; overflow: hidden; margin: 0 0 12px; border-left: 3px solid #14b8a6; border-radius: 0 8px 8px 0; background: #ecfdfb; padding: 9px 10px; color: #28534e; font-size: 12px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+      .progress { height: 5px; overflow: hidden; margin: -4px 0 12px; border-radius: 5px; background: #dbe6e4; }
+      .progress span { display: block; height: 100%; border-radius: inherit; background: #14b8a6; }
+      h2 { margin: 0 0 7px; color: #17211f; font-size: 12px; }
+      ul { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+      li { position: relative; padding-left: 13px; color: #40504c; font-size: 11px; line-height: 1.45; }
+      li::before { content: ''; position: absolute; top: 6px; left: 0; width: 5px; height: 5px; border-radius: 50%; background: #14b8a6; }
+      footer { position: absolute; right: 18px; bottom: 13px; left: 18px; border-top: 1px solid rgba(148,163,184,.18); padding-top: 7px; color: #94a3b8; font-size: 9px; }
     </style>
   </head>
-  <body>
-    <div class="eyebrow">Floating Report</div>
-    <h1>${escapeHtml(report.title)}</h1>
-    <p class="summary">${escapeHtml(report.summary)}</p>
-    <pre>${escapeHtml(report.content)}</pre>
-    <footer>${new Date(report.createdAt).toLocaleString('zh-CN')}</footer>
+  <body data-dock="right">
+    <div class="edge-rail left"></div><div class="edge-rail right"></div>
+    <section class="widget">
+      <header>
+        <div class="identity"><span class="mark">AI</span><div><div class="eyebrow">${kind === 'plan' ? '桌面计划卡' : '桌面行动卡'}</div><div class="title">${escapeHtml(report.title)}</div></div></div>
+        <div class="window-actions"><button id="collapse" title="收进屏幕侧边">‹</button><button id="close" title="关闭">×</button></div>
+      </header>
+      <main>
+        <div class="summary">${escapeHtml(formatFloatingDisplayText(report.summary.slice(0, 150)))}</div>
+        ${kind === 'plan' ? `<div class="progress" title="完成度 ${Math.max(0, Math.min(progress ?? 0, 100))}%"><span style="width:${Math.max(0, Math.min(progress ?? 0, 100))}%"></span></div>` : ''}
+        <h2>接下来</h2>
+        <ul>${getFloatingReportActions(report.content)}</ul>
+        <footer>${kind === 'plan' ? '完整计划保存在计划跟踪' : '完整报告保存在管家工作台'} · ${new Date(report.createdAt).toLocaleDateString('zh-CN')}</footer>
+      </main>
+    </section>
+    <script>
+      const bridge = window.floatingReport
+      document.addEventListener('pointermove', () => bridge?.activity())
+      document.addEventListener('mouseenter', () => bridge?.activity())
+      document.addEventListener('mouseleave', () => bridge?.leave())
+      document.getElementById('collapse').addEventListener('click', () => {
+        if (bridge) bridge.collapse(); else location.href = 'butler-widget://collapse'
+      })
+      document.getElementById('close').addEventListener('click', () => {
+        if (bridge) bridge.close(); else location.href = 'butler-widget://close'
+      })
+    </script>
   </body>
 </html>`
 
   floatingReportWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  floatingReportWindow.webContents.once('did-finish-load', () => {
+    startFloatingReportCursorMonitor()
+    scheduleFloatingReportHide(2800)
+  })
 }
 
 function escapeHtml(value: string) {
@@ -1626,13 +1805,13 @@ function createDefaultConfig(): AgentPlatformConfig {
     activeProviderId: zhipuApiKey ? 'zhipu-default' : 'mock',
     providers,
     customSkills: [],
-    customTools: amapApiKey ? [
+    customTools: [
       {
         id: 'builtin-amap-geocode',
         name: '高德地点解析',
         description: '把城市、地址、车站、机场或酒店名称转换为经纬度，供路线规划使用。',
         endpoint: 'https://restapi.amap.com/v3/geocode/geo?address={{input}}&key={{apiKey}}',
-        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
         timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
       },
       {
@@ -1640,7 +1819,7 @@ function createDefaultConfig(): AgentPlatformConfig {
         name: '高德天气查询',
         description: '查询中国城市当前天气和未来天气预报。输入应包含城市名称和日期要求。',
         endpoint: 'https://restapi.amap.com/v3/weather/weatherInfo?city={{city}}&extensions=all&key={{apiKey}}',
-        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
         timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
       },
       {
@@ -1648,10 +1827,11 @@ function createDefaultConfig(): AgentPlatformConfig {
         name: '高德路线规划',
         description: '根据起点和终点经纬度查询驾车路线、距离与预计耗时。输入格式：起点经度,纬度 到 终点经度,纬度。',
         endpoint: 'https://restapi.amap.com/v5/direction/driving?origin={{origin}}&destination={{destination}}&key={{apiKey}}&show_fields=cost',
-        method: 'GET', apiKey: amapApiKey, apiKeyPlacement: 'query', apiKeyName: 'key',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
         timeoutMs: 15000, retries: 1, version: '1.0.0', enabled: true,
       },
-    ] : [],
+    ],
+    integrations: { amapApiKey: amapApiKey || undefined },
     deletedBuiltinToolIds: [],
     rag: {
       embeddingEnabled: false,
@@ -1687,6 +1867,10 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
   const activeProviderId = providers.some((provider) => provider.id === savedConfig.activeProviderId)
     ? savedConfig.activeProviderId ?? defaultConfig.activeProviderId
     : defaultConfig.activeProviderId
+  const integrations = {
+    ...defaultConfig.integrations,
+    ...(savedConfig.integrations ?? {}),
+  }
 
   const deletedBuiltinToolIds = savedConfig.deletedBuiltinToolIds ?? []
   const defaultToolMap = new Map(defaultConfig.customTools.map((tool) => [tool.id, tool]))
@@ -1694,7 +1878,11 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
   for (const tool of savedConfig.customTools ?? []) {
     if (tool.id.startsWith('extension:')) continue
     const builtin = defaultToolMap.get(tool.id)
-    mergedManualTools.set(tool.id, builtin ? { ...builtin, ...tool, apiKey: builtin.apiKey } : tool)
+    mergedManualTools.set(tool.id, builtin ? {
+      ...builtin,
+      ...tool,
+      apiKey: integrations.amapApiKey || tool.apiKey || builtin.apiKey,
+    } : tool)
   }
   for (const tool of defaultConfig.customTools) {
     if (!deletedBuiltinToolIds.includes(tool.id) && !mergedManualTools.has(tool.id)) mergedManualTools.set(tool.id, tool)
@@ -1708,6 +1896,7 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
       ...extensionConfig.customSkills,
     ],
     customTools: [...mergedManualTools.values(), ...extensionConfig.customTools],
+    integrations,
     deletedBuiltinToolIds,
     rag: {
       ...defaultConfig.rag,
@@ -1746,6 +1935,10 @@ function decryptPlatformConfig(config: Partial<AgentPlatformConfig>): Partial<Ag
       ...tool,
       apiKey: decryptSecret(tool.apiKey),
     })),
+    integrations: config.integrations ? {
+      ...config.integrations,
+      amapApiKey: decryptSecret(config.integrations.amapApiKey),
+    } : undefined,
   }
 }
 
@@ -1760,13 +1953,19 @@ function encryptPlatformConfig(config: AgentPlatformConfig): AgentPlatformConfig
       ...tool,
       apiKey: encryptSecret(tool.apiKey),
     })),
+    integrations: {
+      ...config.integrations,
+      amapApiKey: encryptSecret(config.integrations.amapApiKey),
+    },
   }
 }
 
 function hasPlaintextSecrets(config: Partial<AgentPlatformConfig>) {
-  return [...(config.providers ?? []), ...(config.customTools ?? [])].some(
+  const hasItemSecret = [...(config.providers ?? []), ...(config.customTools ?? [])].some(
     (item) => Boolean(item.apiKey) && !item.apiKey?.startsWith(SAFE_STORAGE_PREFIX),
   )
+  const amapKey = config.integrations?.amapApiKey
+  return hasItemSecret || Boolean(amapKey && !amapKey.startsWith(SAFE_STORAGE_PREFIX))
 }
 
 function readPlatformConfig(): AgentPlatformConfig {
@@ -1900,6 +2099,7 @@ async function requestChatCompletion(provider: ModelProviderConfig, userText: st
   const data = await response.json()
   return {
     content: data.choices?.[0]?.message?.content ?? '模型没有返回内容。',
+    usage: data.usage as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined,
   }
 }
 
@@ -1953,6 +2153,7 @@ async function requestChatCompletionStream(
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
+  let usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined
 
   while (true) {
     const { done, value } = await reader.read()
@@ -1965,6 +2166,7 @@ async function requestChatCompletionStream(
       if (!dataText || dataText === '[DONE]') continue
       try {
         const payload = JSON.parse(dataText)
+        if (payload.usage) usage = payload.usage
         const delta = payload.choices?.[0]?.delta?.content
         if (typeof delta === 'string' && delta.length > 0) {
           content += delta
@@ -1982,7 +2184,24 @@ async function requestChatCompletionStream(
     if (done) break
   }
 
-  return { content: content || '模型没有返回内容。' }
+  return { content: content || '模型没有返回内容。', usage }
+}
+
+function createUsageMetadata(
+  input: string,
+  output: string,
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number },
+) {
+  const estimatedInputTokens = Math.ceil(input.length / 2)
+  const estimatedOutputTokens = Math.ceil(output.length / 2)
+  return {
+    inputLength: input.length,
+    outputLength: output.length,
+    inputTokens: usage?.prompt_tokens ?? estimatedInputTokens,
+    outputTokens: usage?.completion_tokens ?? estimatedOutputTokens,
+    totalTokens: usage?.total_tokens ?? estimatedInputTokens + estimatedOutputTokens,
+    tokenCountEstimated: !usage,
+  }
 }
 
 async function createAiReply(userText: string) {
@@ -1990,78 +2209,47 @@ async function createAiReply(userText: string) {
   return requestChatCompletion(provider, userText)
 }
 
-function extractToolVariables(input: string) {
-  const cityMatch =
-    input.match(/(?:今天|明天|后天)?([^，。,.?\s]{2,12})(?:的)?天气/) ??
-    input.match(/天气.*?(?:在|查|看)?([^，。,.?\s]{2,12})/)
-
-  const routeMatch = input.match(/(-?\d{2,3}(?:\.\d+)?\s*,\s*-?\d{1,2}(?:\.\d+)?)\s*(?:到|至|->|→)\s*(-?\d{2,3}(?:\.\d+)?\s*,\s*-?\d{1,2}(?:\.\d+)?)/)
-  return {
-    input,
-    city: cityMatch?.[1]?.replace(/我想|帮我|查询|看看|今天|明天|后天/g, '') || input,
-    origin: routeMatch?.[1]?.replace(/\s/g, '') || input,
-    destination: routeMatch?.[2]?.replace(/\s/g, '') || input,
-  }
-}
-
-function applyToolTemplate(template: string, input: string, apiKey = '') {
-  const variables = extractToolVariables(input)
-
-  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_match, key: string) => {
-    const value = key === 'apiKey' ? apiKey : variables[key as keyof typeof variables] ?? input
-    return encodeURIComponent(value)
-  })
-}
-
 async function invokeCustomTool(toolId: string, input: string) {
   const config = readPlatformConfig()
   const tool = config.customTools.find((item) => item.id === toolId)
+  if (!tool) throw new Error(`Custom tool not found: ${toolId}`)
+  const circuit = toolCircuitStates.get(toolId)
+  if (circuit && circuit.openUntil > Date.now()) throw new Error(`Tool 熔断中，请在 ${Math.ceil((circuit.openUntil - Date.now()) / 1000)} 秒后重试`)
 
-  if (!tool) {
-    throw new Error(`Custom tool not found: ${toolId}`)
-  }
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(tool.headers ?? {}),
-  }
-
-  if (tool.apiKey && (tool.apiKeyPlacement ?? 'bearer') === 'bearer') {
-    headers.Authorization = `Bearer ${tool.apiKey}`
-  }
-  if (tool.apiKey && tool.apiKeyPlacement === 'header') {
-    headers[tool.apiKeyName || 'X-API-Key'] = tool.apiKey
-  }
-
-  const endpoint = validateHttpEndpoint(applyToolTemplate(tool.endpoint, input, tool.apiKey), 'Tool Endpoint')
-  const retries = Math.max(0, Math.min(Number(tool.retries) || 0, 3))
-  let response: Response | null = null
-  let lastError: unknown
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try {
-      response = await fetch(endpoint, {
-        signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(tool.timeoutMs) || 20_000, 60_000))),
-        method: tool.method,
-        headers,
-        body: tool.method === 'POST' ? JSON.stringify(extractToolVariables(input)) : undefined,
-      })
-      if (response.ok || response.status < 500 || attempt === retries) break
-    } catch (error) {
-      lastError = error
-      if (attempt === retries) throw error
+  try {
+    const prepared = prepareToolRequest(tool, input)
+    const headers: Record<string, string> = { 'Content-Type': 'application/json', ...prepared.headers }
+    if (tool.apiKey && (tool.apiKeyPlacement ?? 'bearer') === 'bearer') headers.Authorization = `Bearer ${tool.apiKey}`
+    if (tool.apiKey && tool.apiKeyPlacement === 'header') headers[tool.apiKeyName || 'X-API-Key'] = tool.apiKey
+    const endpoint = validateHttpEndpoint(prepared.endpoint, 'Tool Endpoint')
+    const retries = Math.max(0, Math.min(Number(tool.retries) || 0, 3))
+    let response: Response | null = null
+    let lastError: unknown
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        response = await fetch(endpoint, {
+          signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(tool.timeoutMs) || 20_000, 60_000))),
+          method: tool.method,
+          headers,
+          body: tool.method === 'POST' ? JSON.stringify(prepared.body) : undefined,
+        })
+        if (response.ok || response.status < 500 || attempt === retries) break
+      } catch (error) {
+        lastError = error
+        if (attempt === retries) throw error
+      }
     }
-  }
-  if (!response) throw lastError instanceof Error ? lastError : new Error('Tool request failed')
-
-  const text = await readResponseTextLimited(response)
-
-  if (!response.ok) {
-    throw new Error(`Custom tool request failed: ${response.status} ${text.slice(0, 200)}`)
-  }
-
-  return {
-    name: tool.name,
-    content: text.slice(0, 8000),
+    if (!response) throw lastError instanceof Error ? lastError : new Error('Tool request failed')
+    const text = await readResponseTextLimited(response)
+    if (!response.ok) throw new Error(`Custom tool request failed: ${response.status} ${text.slice(0, 200)}`)
+    if (hasToolBusinessError(text)) throw new Error(`Tool 返回业务错误：${text.slice(0, 180)}`)
+    const content = extractToolResponse(text, tool.responsePath).slice(0, 8000)
+    toolCircuitStates.delete(toolId)
+    return { name: tool.name, content }
+  } catch (error) {
+    const failures = (toolCircuitStates.get(toolId)?.failures ?? 0) + 1
+    toolCircuitStates.set(toolId, { failures, openUntil: failures >= 3 ? Date.now() + 30_000 : 0 })
+    throw error
   }
 }
 
@@ -2069,7 +2257,7 @@ async function requestAmapJson(endpoint: string) {
   const response = await fetch(validateHttpEndpoint(endpoint, '高德 Web 服务'), { signal: AbortSignal.timeout(20_000) })
   const payload = await response.json() as Record<string, unknown>
   if (!response.ok || String(payload.status) !== '1') {
-    throw new Error(`高德 API 调用失败：${String(payload.info ?? response.status)}`)
+    throw new Error(`高德 API 调用失败：${String(payload.info ?? response.status)}（${String(payload.infocode ?? '无错误码')}）`)
   }
   return payload
 }
@@ -2078,8 +2266,8 @@ async function planTripWithAmap(value: unknown) {
   const draft = value as { origin?: unknown; destination?: unknown; dateText?: unknown }
   const origin = String(draft.origin ?? '').trim().slice(0, 120)
   const destination = String(draft.destination ?? '').trim().slice(0, 120)
-  const dateText = String(draft.dateText ?? '').trim().slice(0, 40)
-  const key = localEnv.AMAP_API_KEY?.trim()
+  const dateText = formatFloatingDisplayText(String(draft.dateText ?? '').trim().slice(0, 40))
+  const key = readPlatformConfig().integrations.amapApiKey?.trim()
   if (!origin || !destination) throw new Error('出发地和目的地不能为空')
   if (!key) throw new Error('未配置高德 Web 服务 Key')
 
@@ -2175,7 +2363,7 @@ ipcMain.handle('ai:chat', async (_event, userText: string) => {
   const startedAt = Date.now()
   try {
     const reply = await createAiReply(userText)
-    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: { inputLength: userText.length, outputLength: reply.content.length } })
+    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: createUsageMetadata(userText, reply.content, reply.usage) })
     return reply
   } catch (error) {
     writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话失败', detail: error, status: 'failure', durationMs: Date.now() - startedAt })
@@ -2186,13 +2374,24 @@ ipcMain.handle('ai:chat', async (_event, userText: string) => {
 ipcMain.handle('ai:chat-stream', async (event, requestId: string, userText: string) => {
   const provider = getActiveProvider()
   const startedAt = Date.now()
+  let firstTokenAt: number | undefined
   try {
     const reply = await requestChatCompletionStream(provider, userText, (delta) => {
+      firstTokenAt ??= Date.now()
       if (!event.sender.isDestroyed()) {
         event.sender.send('ai:chat-stream-delta', requestId, delta)
       }
     })
-    writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复完成：${provider.name}`, durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model, inputLength: userText.length, outputLength: reply.content.length } })
+    writeAuditLog({
+      category: 'agent', action: 'chat.stream', summary: `流式回复完成：${provider.name}`,
+      durationMs: Date.now() - startedAt,
+      metadata: {
+        providerId: provider.id,
+        model: provider.model,
+        firstTokenMs: firstTokenAt ? firstTokenAt - startedAt : undefined,
+        ...createUsageMetadata(userText, reply.content, reply.usage),
+      },
+    })
     return reply
   } catch (error) {
     writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复失败：${provider.name}`, detail: error, status: 'failure', durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model } })
@@ -2466,6 +2665,55 @@ ipcMain.handle('workflow:open-floating-report', (_event, reportId: string) => {
 
   openFloatingReport(report)
   return true
+})
+
+ipcMain.handle('workflow:open-floating-plan', (_event, planId: string) => {
+  const plan = readWorkspaceData().plans.find((item) => item.id === planId)
+  if (!plan) return false
+  const status = plan.status === 'done' ? '已完成' : '进行中'
+  const dueText = plan.dueDate ? ` · 截止 ${formatFloatingDisplayText(plan.dueDate)}` : ''
+  const content = [
+    `- 下一步：${plan.nextAction || plan.description || '继续推进当前计划'}`,
+    `- 截止日期：${plan.dueDate ? formatFloatingDisplayText(plan.dueDate) : '未设置'}`,
+    `- 提醒：${plan.reminderTime || '未设置'}`,
+  ].join('\n')
+  openFloatingReport({
+    id: plan.id,
+    title: plan.title,
+    summary: `${status} · 完成度 ${plan.progress}%${dueText}`,
+    content,
+    source: '计划跟踪',
+    createdAt: plan.updatedAt,
+  }, 'plan', plan.progress)
+  return true
+})
+
+function isFloatingReportSender(senderId: number) {
+  return Boolean(floatingReportWindow && !floatingReportWindow.isDestroyed() && floatingReportWindow.webContents.id === senderId)
+}
+
+ipcMain.on('floating-report:activity', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportLastHoverAt = Date.now()
+  clearFloatingReportHideTimer()
+  if (floatingReportHidden) expandFloatingReport()
+})
+
+ipcMain.on('floating-report:leave', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportLastHoverAt = Date.now() - 1600
+  scheduleFloatingReportHide(500)
+})
+
+ipcMain.on('floating-report:collapse', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  clearFloatingReportHideTimer()
+  moveFloatingReport(true)
+})
+
+ipcMain.on('floating-report:close', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportWindow?.close()
 })
 
 ipcMain.handle('platform:get-extensions-path', () => {

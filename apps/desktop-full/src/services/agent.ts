@@ -2,11 +2,13 @@ import { AgentOrchestrator } from '../agent/orchestrator'
 import type {
   AgentDecision,
   AgentObservation,
+  AgentRun,
   AgentRuntimeEvent,
   AgentToolCall,
   AgentToolDefinition,
 } from '../agent/protocol'
 import { toolRegistry, type ToolName } from '../agent/toolRegistry'
+import { wrapUntrustedCollection, wrapUntrustedContent } from '../agent/security'
 import { createAssistantReply, streamAssistantReply, type AssistantReply } from './assistant'
 
 export type ToolCallStatus = 'success' | 'error'
@@ -57,6 +59,9 @@ type AgentOptions = {
   onRunComplete?: (run: import('../agent/protocol').AgentRun) => Promise<unknown> | unknown
   onRunUpdate?: (run: import('../agent/protocol').AgentRun) => Promise<unknown> | unknown
   requestPermission: PermissionRequester
+  signal?: AbortSignal
+  shouldPause?: () => boolean | Promise<boolean>
+  resumeFrom?: AgentRun
 }
 
 function createId() {
@@ -237,7 +242,7 @@ async function executeTool(
     if (!allowed) return fail('用户拒绝读取本地文件')
     const pickedFile = await window.electronAPI.pickTextFile()
     if (!pickedFile) return fail('用户取消选择文件')
-    return succeed(pickedFile.name, `文件名：${pickedFile.name}\n文件内容：\n${pickedFile.content}`)
+    return succeed(pickedFile.name, wrapUntrustedContent(pickedFile.name, pickedFile.content))
   }
 
   if (call.name === 'queryKnowledgeBase') {
@@ -250,12 +255,10 @@ async function executeTool(
     if (results.length === 0) return fail('知识库没有检索到相关片段')
 
     const sourceNames = [...new Set(results.map((result) => result.documentName))]
-    const context = results
-      .map(
-        (result, index) =>
-          `[${index + 1}] 来源：${result.documentName}，片段 ${result.chunkIndex + 1}，检索：${result.retrievalMode === 'hybrid' ? 'BM25 + 向量混合' : 'BM25'}\n${result.content}`,
-      )
-      .join('\n\n')
+    const context = wrapUntrustedCollection(results.map((result, index) => ({
+      label: `[${index + 1}] ${result.documentName} / 片段 ${result.chunkIndex + 1} / ${result.retrievalMode === 'hybrid' ? 'BM25 + 向量混合' : 'BM25'}`,
+      content: result.content,
+    })))
     return succeed(
       `命中 ${results.length} 个片段 / ${sourceNames.join('、')}`,
       `本地知识库检索结果：\n\n${context}\n\n回答时请引用 [1]、[2] 这样的来源编号。`,
@@ -281,6 +284,8 @@ function emitTimeline(event: AgentRuntimeEvent, onTimeline: TimelineLogger) {
   if (event.type === 'tool-start') onTimeline(createTimelineStep('调用工具', `${event.call.name}${event.call.reason ? `：${event.call.reason}` : ''}`, 'success'))
   if (event.type === 'tool-finish') onTimeline(createTimelineStep('观察结果', event.observation.summary, event.observation.ok ? 'success' : 'error'))
   if (event.type === 'complete') onTimeline(createTimelineStep('Agent 完成', event.detail, 'success'))
+  if (event.type === 'paused') onTimeline(createTimelineStep('Agent 已暂停', event.detail, 'success'))
+  if (event.type === 'cancelled') onTimeline(createTimelineStep('Agent 已取消', event.detail, 'error'))
 }
 
 export async function runAgent(
@@ -298,6 +303,10 @@ export async function runAgent(
   const orchestrator = new AgentOrchestrator({
     tools,
     maxTurns: 4,
+    maxToolCalls: 12,
+    maxDurationMs: 120_000,
+    signal: options.signal,
+    shouldPause: options.shouldPause,
     onCheckpoint: options.onRunUpdate,
     onEvent: (event) => emitTimeline(event, options.onTimeline),
     decide: async ({ observations }) => {
@@ -320,12 +329,21 @@ export async function runAgent(
     },
   })
 
-  const run = await orchestrator.run(userText)
+  const run = await orchestrator.run(userText, options.resumeFrom)
   await options.onRunComplete?.(run)
   logger(createToolLog(`agent.run:${run.id}`, run.status === 'failed' ? 'error' : 'success', `${run.status} / ${run.turns} 轮 / ${run.observations.length} 次工具调用`))
 
   if (run.status === 'failed') {
     return { content: `Agent 执行失败：${run.error ?? '未知错误'}` }
+  }
+  if (run.status === 'paused') {
+    return { content: '任务已暂停。我保存了当前步骤，你可以稍后点击“继续任务”从这里恢复。' }
+  }
+  if (run.status === 'cancelled') {
+    return { content: '任务已取消，已经完成的工具结果仍保留在运行记录中。' }
+  }
+  if (run.status === 'blocked') {
+    return { content: run.final ?? `任务已停止：${run.error ?? '没有得到足够的工具结果'}` }
   }
   return { content: run.final ?? 'Agent 已完成运行，但没有生成可展示的回复。' }
 }

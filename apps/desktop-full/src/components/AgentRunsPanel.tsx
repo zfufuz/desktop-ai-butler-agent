@@ -10,9 +10,7 @@ export type AgentRunSnapshot = {
   error?: string
 }
 
-type AgentRunsPanelProps = {
-  runs: AgentRunSnapshot[]
-}
+type AgentRunsPanelProps = { runs: AgentRunSnapshot[] }
 
 function getStatusLabel(status: AgentRunSnapshot['status']) {
   if (status === 'completed') return '已完成'
@@ -40,7 +38,12 @@ function AgentRunsPanel({ runs }: AgentRunsPanelProps) {
             {run.error && <p className="run-error">{run.error}</p>}
             {run.observations.map((item, index) => {
               const observation = item as { toolName?: string; ok?: boolean; summary?: string; attempts?: number }
-              return <div className="run-observation" key={index}><strong>{observation.toolName ?? `观察 ${index + 1}`}</strong><small>{observation.ok ? '成功' : '失败'} · {observation.summary}{observation.attempts && observation.attempts > 1 ? ` · 尝试 ${observation.attempts} 次` : ''}</small></div>
+              return (
+                <div className="run-observation" key={index}>
+                  <strong>{observation.toolName ?? `观察 ${index + 1}`}</strong>
+                  <small>{observation.ok ? '成功' : '失败'} · {observation.summary}{observation.attempts && observation.attempts > 1 ? ` · 尝试 ${observation.attempts} 次` : ''}</small>
+                </div>
+              )
             })}
           </details>
         ))}

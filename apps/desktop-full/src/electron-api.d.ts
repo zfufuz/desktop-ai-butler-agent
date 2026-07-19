@@ -54,12 +54,16 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
-  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyPlacement?: 'none' | 'bearer' | 'query' | 'header'
   apiKeyName?: string
   headers?: Record<string, string>
   timeoutMs?: number
   retries?: number
   version?: string
+  inputSchema?: { properties: Record<string, { type: 'string' | 'number' | 'boolean'; description?: string }>; required?: string[] }
+  queryParams?: Record<string, string>
+  bodyParams?: Record<string, string>
+  responsePath?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -70,6 +74,9 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  integrations: {
+    amapApiKey?: string
+  }
   deletedBuiltinToolIds?: string[]
 }
 
@@ -262,6 +269,7 @@ declare global {
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>
       notify: (title: string, body: string) => Promise<boolean>
       openFloatingReport: (reportId: string) => Promise<boolean>
+      openFloatingPlan: (planId: string) => Promise<boolean>
       getExtensionsPath: () => Promise<string>
       openExtensionsFolder: () => Promise<string>
       invokeCustomTool: (toolId: string, input: string) => Promise<CustomToolResult>

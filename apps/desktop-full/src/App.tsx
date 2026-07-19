@@ -6,9 +6,14 @@ import {
   Download,
   FileText,
   ListChecks,
+  Pause,
+  Pin,
   Plane,
+  Play,
   ReceiptText,
   Settings,
+  Square,
+  Trash2,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -20,6 +25,7 @@ import AuditLogPanel, {
   type AuditLogFilters,
 } from './components/AuditLogPanel'
 import ChatInput from './components/ChatInput'
+import EvalPanel from './components/EvalPanel'
 import KnowledgePanel, {
   type KnowledgeDocumentSummary,
   type KnowledgeSearchResult,
@@ -33,14 +39,16 @@ import {
   type ToolCallLog,
 } from './services/agent'
 import { toolRegistry } from './agent/toolRegistry'
+import type { AgentRun } from './agent/protocol'
+import { wrapUntrustedCollection, wrapUntrustedContent } from './agent/security'
 import { getSkillDefinition, skillRegistry, type SkillId } from './skills/skillRegistry'
 import type { AssistantStatus, Message } from './type'
 
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
-type SettingsPage = 'home' | 'provider' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
+type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -89,12 +97,16 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
-  apiKeyPlacement?: 'bearer' | 'query' | 'header'
+  apiKeyPlacement?: 'none' | 'bearer' | 'query' | 'header'
   apiKeyName?: string
   headers?: Record<string, string>
   timeoutMs?: number
   retries?: number
   version?: string
+  inputSchema?: { properties: Record<string, { type: 'string' | 'number' | 'boolean'; description?: string }>; required?: string[] }
+  queryParams?: Record<string, string>
+  bodyParams?: Record<string, string>
+  responsePath?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -105,6 +117,9 @@ type AgentPlatformConfig = {
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
   rag: RagConfig
+  integrations: {
+    amapApiKey?: string
+  }
   deletedBuiltinToolIds?: string[]
 }
 
@@ -180,6 +195,14 @@ type TripResultCard = {
   savedToPlan?: boolean
 }
 
+type PendingReportCard = {
+  title: string
+  summary: string
+  content: string
+  source: string
+  planCount: number
+}
+
 type BuiltinOverride = {
   name?: string
   description?: string
@@ -201,6 +224,13 @@ type MemoryNote = {
 
 function createMessageId() {
   return Date.now() + Math.random()
+}
+
+function parseOptionalJsonObject<T>(text: string, label: string): T | undefined {
+  if (!text.trim()) return undefined
+  const parsed = JSON.parse(text) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label} 必须是 JSON 对象`)
+  return parsed as T
 }
 
 function createLocalId(prefix: string) {
@@ -300,19 +330,35 @@ function isTripPlanningRequest(text: string) {
   return /出差|差旅|行程|订票|酒店|住宿|高铁|火车|飞机|航班|交通|报销预算/.test(text)
 }
 
+function normalizeTripDate(value?: string) {
+  if (!value) return value
+  const compact = value.match(/^(20\d{2})(\d{2})(\d{2})$/)
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`
+  const dashed = value.match(/^(20\d{2})-(\d{1,2})-(\d{1,2})$/)
+  if (dashed) return `${dashed[1]}-${dashed[2].padStart(2, '0')}-${dashed[3].padStart(2, '0')}`
+  return value
+}
+
+function sanitizeTripAdvice(content: string) {
+  const sanitized = content.split(/\r?\n/).filter((line) =>
+    !/配置.*(?:Tool|工具)|未配置.*(?:Tool|工具)|API.*(?:错误|问题|失败)|无法确定.*(?:交通|天气)|ENGINE_RESPONSE|infocode/i.test(line),
+  ).join('\n').trim()
+  return sanitized || '## 行前待办\n- 确认出发时间与证件\n- 根据天气准备衣物\n## 报销材料\n- 保存交通与住宿凭证'
+}
+
 function extractTripDraft(text: string): TripDraft {
   const destinationMatch =
     text.match(/去([^，。,.?\s]{2,12})(?:出差|开会|拜访|培训|参会)?/) ??
     text.match(/到([^，。,.?\s]{2,12})(?:出差|开会|拜访|培训|参会)?/)
   const originMatch = text.match(/从([^，。,.?\s]{2,12})(?:出发|去|到)/)
-  const dateMatch = text.match(/(今天|明天|后天|下周[一二三四五六日天]?|\d{1,2}月\d{1,2}[日号]?|\d{4}-\d{1,2}-\d{1,2})/)
+  const dateMatch = text.match(/(今天|明天|后天|下周[一二三四五六日天]?|\d{1,2}月\d{1,2}[日号]?|\d{8}|\d{4}-\d{1,2}-\d{1,2})/)
   const nightsMatch = text.match(/住(\d+)晚|(\d+)晚|当天来回/)
   const purposeMatch = text.match(/(?:为了|去|参加|拜访|开)([^，。,.?\s]{2,18})(?:出差|会议|客户|培训)?/)
 
   return {
     origin: originMatch?.[1],
     destination: destinationMatch?.[1],
-    dateText: dateMatch?.[1],
+    dateText: normalizeTripDate(dateMatch?.[1]),
     nights: nightsMatch?.[1] ?? nightsMatch?.[2] ?? (text.includes('当天来回') ? '0' : undefined),
     purpose: purposeMatch?.[1],
   }
@@ -322,7 +368,7 @@ function mergeTripDraft(currentDraft: TripDraft, nextDraft: TripDraft) {
   return {
     origin: nextDraft.origin ?? currentDraft.origin,
     destination: nextDraft.destination ?? currentDraft.destination,
-    dateText: nextDraft.dateText ?? currentDraft.dateText,
+    dateText: normalizeTripDate(nextDraft.dateText ?? currentDraft.dateText),
     nights: nextDraft.nights ?? currentDraft.nights,
     purpose: nextDraft.purpose ?? currentDraft.purpose,
   }
@@ -354,7 +400,7 @@ function findTripTool(tools: CustomToolConfig[], kind: 'weather' | 'transport' |
 
   return tools.find((tool) => {
     const target = `${tool.name} ${tool.description} ${tool.endpoint}`.toLowerCase()
-    return tool.enabled !== false && keywords[kind].test(target)
+    return tool.enabled !== false && !tool.id.startsWith('builtin-amap-') && keywords[kind].test(target)
   })
 }
 
@@ -395,6 +441,12 @@ function parseImportedTool(file: LocalTextFile) {
     apiKeyName: parsed.apiKeyName?.trim() || '',
     timeoutMs: parsed.timeoutMs ?? 20000,
     retries: parsed.retries ?? 0,
+    version: parsed.version ?? '1.0.0',
+    headersJson: parsed.headers ? JSON.stringify(parsed.headers, null, 2) : '',
+    inputSchemaJson: parsed.inputSchema ? JSON.stringify(parsed.inputSchema, null, 2) : '',
+    queryParamsJson: parsed.queryParams ? JSON.stringify(parsed.queryParams, null, 2) : '',
+    bodyParamsJson: parsed.bodyParams ? JSON.stringify(parsed.bodyParams, null, 2) : '',
+    responsePath: parsed.responsePath ?? '',
   }
 }
 
@@ -481,6 +533,7 @@ function App() {
   const [knowledgeQuery, setKnowledgeQuery] = useState('')
   const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeSearchResult[]>([])
   const [agentRuns, setAgentRuns] = useState<AgentRunSnapshot[]>([])
+  const [pausedAgentRun, setPausedAgentRun] = useState<AgentRun | null>(null)
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([])
   const [auditLogsLoading, setAuditLogsLoading] = useState(false)
   const [memoryNotes, setMemoryNotes] = useState<MemoryNote[]>(() =>
@@ -509,12 +562,19 @@ function App() {
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => localStorage.getItem('ai-butler:rightPanelCollapsed') === 'true')
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null)
   const [editingToolId, setEditingToolId] = useState<string | null>(null)
-  const [pendingFileReadStep, setPendingFileReadStep] = useState<PendingFileReadStep>(null)
-  const [pendingTripStep, setPendingTripStep] = useState<PendingTripStep>(null)
-  const [tripDraft, setTripDraft] = useState<TripDraft>({})
+  const [pendingFileReadStep, setPendingFileReadStep] = useState<PendingFileReadStep>(() =>
+    readJsonFromStorage('ai-butler:pendingFileReadStep', null),
+  )
+  const [pendingTripStep, setPendingTripStep] = useState<PendingTripStep>(() =>
+    readJsonFromStorage('ai-butler:pendingTripStep', null),
+  )
+  const [tripDraft, setTripDraft] = useState<TripDraft>(() =>
+    readJsonFromStorage('ai-butler:tripDraft', {}),
+  )
   const [tripPlannerOpen, setTripPlannerOpen] = useState(false)
   const [tripResultCard, setTripResultCard] = useState<TripResultCard | null>(null)
-  const [voiceEnabled, setVoiceEnabled] = useState(false)
+  const [pendingReportCard, setPendingReportCard] = useState<PendingReportCard | null>(null)
+  const [voiceEnabled, setVoiceEnabled] = useState(() => localStorage.getItem('ai-butler:voiceEnabled') === 'true')
   const [alwaysOnTop, setAlwaysOnTop] = useState(false)
   const [platformConfig, setPlatformConfig] = useState<AgentPlatformConfig | null>(null)
   const [ragStatus, setRagStatus] = useState('')
@@ -561,10 +621,16 @@ function App() {
     endpoint: '',
     method: 'POST' as 'GET' | 'POST',
     apiKey: '',
-    apiKeyPlacement: 'bearer' as 'bearer' | 'query' | 'header',
+    apiKeyPlacement: 'bearer' as 'none' | 'bearer' | 'query' | 'header',
     apiKeyName: '',
     timeoutMs: 20000,
     retries: 0,
+    version: '1.0.0',
+    headersJson: '',
+    inputSchemaJson: '',
+    queryParamsJson: '',
+    bodyParamsJson: '',
+    responsePath: '',
   })
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -606,6 +672,8 @@ function App() {
     }))
     .filter((tool) => !tool.deleted)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const agentAbortControllerRef = useRef<AbortController | null>(null)
+  const agentPauseRequestedRef = useRef(false)
   const hasSyncedKnowledgeRef = useRef(false)
   const hasSyncedMemoryRef = useRef(false)
 
@@ -672,7 +740,28 @@ function App() {
     window.electronAPI.getExtensionsPath().then(setExtensionsPath)
     window.electronAPI.getWorkflowData().then(setWorkflowData)
     window.electronAPI.getKnowledgeDocuments().then(setKnowledgeIndex)
-    window.electronAPI.getAgentRuns().then(setAgentRuns)
+    window.electronAPI.getAgentRuns().then(async (runs) => {
+      const restoredRuns = [...runs]
+      const resumableRun = restoredRuns.find((run) => run.status === 'paused' || run.status === 'running')
+
+      if (resumableRun) {
+        const restoredRun: AgentRun = {
+          ...resumableRun,
+          status: 'paused',
+          observations: resumableRun.observations as AgentRun['observations'],
+          pauseReason: resumableRun.status === 'running' ? '应用上次退出时任务仍在运行' : '用户暂停任务',
+        }
+        setPausedAgentRun(restoredRun)
+
+        if (resumableRun.status === 'running') {
+          const savedRun = await window.electronAPI.saveAgentRun(restoredRun)
+          const index = restoredRuns.findIndex((run) => run.id === savedRun.id)
+          if (index >= 0) restoredRuns[index] = savedRun
+        }
+      }
+
+      setAgentRuns(restoredRuns)
+    })
     window.electronAPI.getAuditLogs({ limit: 100 }).then(setAuditLogs)
     window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
       const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
@@ -723,6 +812,22 @@ function App() {
   useEffect(() => {
     localStorage.setItem('ai-butler:builtinToolOverrides', JSON.stringify(builtinToolOverrides))
   }, [builtinToolOverrides])
+
+  useEffect(() => {
+    localStorage.setItem('ai-butler:pendingFileReadStep', JSON.stringify(pendingFileReadStep))
+  }, [pendingFileReadStep])
+
+  useEffect(() => {
+    localStorage.setItem('ai-butler:pendingTripStep', JSON.stringify(pendingTripStep))
+  }, [pendingTripStep])
+
+  useEffect(() => {
+    localStorage.setItem('ai-butler:tripDraft', JSON.stringify(tripDraft))
+  }, [tripDraft])
+
+  useEffect(() => {
+    localStorage.setItem('ai-butler:voiceEnabled', String(voiceEnabled))
+  }, [voiceEnabled])
 
   useEffect(() => {
     localStorage.setItem('ai-butler:leftPanelWidth', String(leftPanelWidth))
@@ -791,8 +896,17 @@ function App() {
     }
 
     window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(text.slice(0, 300))
+    const spokenText = text
+      .replace(/```[\s\S]*?```/g, '代码块已省略。')
+      .replace(/[*#>`_()[\]~-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const utterance = new SpeechSynthesisUtterance(spokenText.slice(0, 600))
     utterance.lang = 'zh-CN'
+    utterance.rate = 1.02
+    utterance.voice = window.speechSynthesis.getVoices().find((voice) =>
+      voice.lang.toLowerCase().startsWith('zh'),
+    ) ?? null
     window.speechSynthesis.speak(utterance)
   }
 
@@ -821,7 +935,11 @@ function App() {
     speak(content)
   }
 
-  async function saveGeneratedReport(content: string, source: string): Promise<SavedReportResult | null> {
+  async function saveGeneratedReport(
+    content: string,
+    source: string,
+    createPlans = false,
+  ): Promise<SavedReportResult | null> {
     if (!isElectronReady) {
       return null
     }
@@ -837,7 +955,7 @@ function App() {
     const savedReport = nextData.reports[0]
     const createdPlans: ButlerPlan[] = []
 
-    const planDrafts = extractPlanDraftsFromReport(content)
+    const planDrafts = createPlans ? extractPlanDraftsFromReport(content) : []
     if (planDrafts.length > 0) {
       let currentData = nextData
       for (const draft of planDrafts.slice(0, 3)) {
@@ -855,6 +973,32 @@ function App() {
           createdPlans,
         }
       : null
+  }
+
+  function queueGeneratedReport(content: string, source: string) {
+    setPendingReportCard({
+      title: source.includes('文件夹') ? '资料夹分析报告' : `${source} 分析报告`,
+      summary: createReportSummary(content),
+      content,
+      source,
+      planCount: Math.min(extractPlanDraftsFromReport(content).length, 3),
+    })
+  }
+
+  async function confirmGeneratedReport(createPlans: boolean) {
+    if (!pendingReportCard) return
+    const card = pendingReportCard
+    const savedResult = await saveGeneratedReport(card.content, card.source, createPlans)
+    setPendingReportCard(null)
+    await streamAssistantMessage(createWorkflowDoneMessage(savedResult))
+  }
+
+  async function downloadGeneratedReport() {
+    if (!pendingReportCard) return
+    await window.electronAPI.exportTripCard({
+      title: pendingReportCard.title,
+      content: pendingReportCard.content,
+    })
   }
 
   function getUnavailableModelMessage(files: LocalTextFile[]) {
@@ -889,13 +1033,13 @@ function App() {
 
 1. 已保存报告
 报告名称：${result.report.title}
-位置：右侧「报告悬浮窗」模块
+位置：右侧「桌面行动卡」模块
 
 2. 已提取计划
 ${planLines}
 
 3. 下一步你可以做
-- 点右侧「悬浮到桌面」，把报告放到桌面上
+- 点右侧「固定到桌面边缘」，把报告变成可侧边收起的桌面行动卡
 - 在「计划打卡」里对计划打卡、完成或删除
 - 在「行动记录」里记录你今天做了什么，后续我可以根据记录调整计划`
   }
@@ -923,7 +1067,7 @@ ${planLines}
 ${recentContext}`,
       )
       await streamAssistantMessage(reply.content)
-      await saveGeneratedReport(reply.content, '最近对话')
+      queueGeneratedReport(reply.content, '最近对话')
     } catch {
       await streamAssistantMessage('生成报告失败。请检查模型配置或网络。')
     } finally {
@@ -1097,6 +1241,11 @@ ${progressText}`,
     await window.electronAPI.openFloatingReport(reportId)
   }
 
+  async function openFloatingPlan(planId: string) {
+    if (!isElectronReady) return
+    await window.electronAPI.openFloatingPlan(planId)
+  }
+
   async function deleteReport(report: ButlerReport) {
     if (!isElectronReady || !window.confirm(`确定删除报告“${report.title}”？`)) return
     setWorkflowData(await window.electronAPI.deleteReport(report.id))
@@ -1114,6 +1263,9 @@ ${progressText}`,
 
     try {
       const result = await window.electronAPI.invokeCustomTool(tool.id, input)
+      if (/"status"\s*:\s*"?0|ENGINE_RESPONSE_DATA_ERROR|INVALID_USER_KEY|"infocode"\s*:\s*"?3\d+/i.test(result.content)) {
+        throw new Error('Tool 返回业务错误')
+      }
       addToolLog({
         id: createMessageId(),
         name: `trip:${tool.name}`,
@@ -1135,6 +1287,7 @@ ${progressText}`,
   }
 
   async function runTripPlanner(draft: TripDraft) {
+    draft = { ...draft, dateText: normalizeTripDate(draft.dateText) }
     const enabledTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
     const hotelTool = findTripTool(enabledTools, 'hotel')
     const tripInput = `从${draft.origin}去${draft.destination}，时间${draft.dateText}，住${draft.nights}晚，目的：${draft.purpose ?? '普通出差'}`
@@ -1157,7 +1310,7 @@ ${progressText}`,
     const transportResult = amapResult.route
       ? `驾车距离 ${(amapResult.route.distanceMeters / 1000).toFixed(1)} 公里，预计 ${(amapResult.route.durationSeconds / 3600).toFixed(1)} 小时，过路费约 ${amapResult.route.tolls} 元。高铁和机票价格需另外接入票务 API。`
       : '暂无路线数据'
-    const safeHotelResult = hotelResult.startsWith('未配置') || hotelResult.includes('调用失败')
+    const safeHotelResult = hotelResult.startsWith('未配置') || hotelResult.includes('调用失败') || /"status"\s*:\s*"?0/.test(hotelResult)
       ? '暂无实时酒店价格，请按公司住宿标准筛选。'
       : hotelResult
 
@@ -1198,7 +1351,7 @@ ${historyContext}
 - **天气**：${weatherResult}
 - **住宿**：${safeHotelResult}
 
-${reply.content}`
+${sanitizeTripAdvice(reply.content)}`
     await streamAssistantMessage(factualSummary)
     const facts = [transportResult, weatherResult]
     facts.push(`住宿：${safeHotelResult}`)
@@ -1267,6 +1420,102 @@ ${reply.content}`
     }
 
     await runTripPlanner(nextDraft)
+  }
+
+  async function persistAgentRun(run: AgentRun) {
+    const savedRun = await window.electronAPI.saveAgentRun(run)
+    setAgentRuns((currentRuns) => [
+      savedRun,
+      ...currentRuns.filter((item) => item.id !== savedRun.id),
+    ])
+    if (run.status === 'paused') {
+      setPausedAgentRun(run)
+    } else if (run.status !== 'running' && pausedAgentRun?.id === run.id) {
+      setPausedAgentRun(null)
+    }
+  }
+
+  async function executeAgentRequest(text: string, resumeFrom?: AgentRun) {
+    const enabledCustomTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
+    const modeHint = '请优先用通俗表达帮助用户整理资料、分析文件、生成报告和可执行计划。'
+    const memoryContext = memoryNotes.length > 0
+      ? `\n\n用户长期记忆：\n${memoryNotes.map((note) => note.text).join('\n')}`
+      : ''
+    let streamedMessageId: number | null = null
+    let streamedContent = ''
+    const controller = new AbortController()
+    agentAbortControllerRef.current = controller
+    agentPauseRequestedRef.current = false
+    if (!resumeFrom) setPausedAgentRun(null)
+
+    const assistantReply = await runAgent(text, addToolLog, {
+      knowledgeDocuments,
+      builtinTools: builtinToolViews
+        .filter((tool) => tool.enabled)
+        .map(({ displayName, displayDescription, enabled: _enabled, deleted: _deleted, ...tool }) => ({
+          ...tool,
+          label: displayName,
+          description: displayDescription,
+        })),
+      customTools: enabledCustomTools,
+      context: `${modeHint}${memoryContext}`,
+      onTimeline: addTimelineStep,
+      requestPermission: requestToolPermission,
+      onRunUpdate: persistAgentRun,
+      onRunComplete: persistAgentRun,
+      signal: controller.signal,
+      shouldPause: () => agentPauseRequestedRef.current,
+      resumeFrom,
+      onAssistantDelta: (delta) => {
+        streamedContent += delta
+        if (streamedMessageId === null) {
+          streamedMessageId = createMessageId()
+          setMessages((currentMessages) => [
+            ...currentMessages,
+            { id: streamedMessageId!, role: 'assistant', content: streamedContent, createdAt: Date.now() },
+          ])
+          return
+        }
+
+        const targetMessageId = streamedMessageId
+        setMessages((currentMessages) => currentMessages.map((message) =>
+          message.id === targetMessageId ? { ...message, content: streamedContent } : message,
+        ))
+      },
+    })
+
+    if (streamedMessageId === null) {
+      await streamAssistantMessage(assistantReply.content)
+    } else {
+      const targetMessageId = streamedMessageId
+      setMessages((currentMessages) => currentMessages.map((message) =>
+        message.id === targetMessageId ? { ...message, content: assistantReply.content } : message,
+      ))
+      speak(assistantReply.content)
+    }
+    agentAbortControllerRef.current = null
+  }
+
+  function pauseAgentRun() {
+    agentPauseRequestedRef.current = true
+  }
+
+  function cancelAgentRun() {
+    agentAbortControllerRef.current?.abort()
+  }
+
+  async function resumeAgentRun() {
+    if (!pausedAgentRun || isThinking) return
+    setAssistantStatus('thinking')
+    setAgentTimeline([])
+    try {
+      await executeAgentRequest(pausedAgentRun.goal, pausedAgentRun)
+    } catch {
+      await streamAssistantMessage('任务恢复失败，请在运行记录中查看错误后重试。')
+    } finally {
+      agentAbortControllerRef.current = null
+      setAssistantStatus('idle')
+    }
   }
 
   async function sendMessage() {
@@ -1404,64 +1653,7 @@ ${reply.content}`
         return
       }
 
-      const modeHint =
-        mode === 'user'
-          ? '当前是普通用户版，请优先用通俗表达帮助用户整理资料、分析文件、生成报告。'
-          : '当前是开发者模式，可以解释 Agent、Provider、Skill、Tool、RAG、IPC 等技术细节。'
-      const memoryContext =
-        memoryNotes.length > 0 ? `\n\n用户长期记忆：\n${memoryNotes.map((note) => note.text).join('\n')}` : ''
-      let streamedMessageId: number | null = null
-      let streamedContent = ''
-      const assistantReply = await runAgent(text, addToolLog, {
-        knowledgeDocuments,
-        builtinTools: builtinToolViews
-          .filter((tool) => tool.enabled)
-          .map(({ displayName, displayDescription, enabled: _enabled, deleted: _deleted, ...tool }) => ({
-            ...tool,
-            label: displayName,
-            description: displayDescription,
-          })),
-        customTools: enabledCustomTools,
-        context: `${modeHint}${memoryContext}`,
-        onTimeline: addTimelineStep,
-        requestPermission: requestToolPermission,
-        onRunUpdate: (run) => window.electronAPI.saveAgentRun(run),
-        onRunComplete: (run) => window.electronAPI.saveAgentRun(run),
-        onAssistantDelta: (delta) => {
-          streamedContent += delta
-          if (streamedMessageId === null) {
-            streamedMessageId = createMessageId()
-            setMessages((currentMessages) => [
-              ...currentMessages,
-              {
-                id: streamedMessageId!,
-                role: 'assistant',
-                content: streamedContent,
-                createdAt: Date.now(),
-              },
-            ])
-            return
-          }
-
-          const targetMessageId = streamedMessageId
-          setMessages((currentMessages) =>
-            currentMessages.map((message) =>
-              message.id === targetMessageId ? { ...message, content: streamedContent } : message,
-            ),
-          )
-        },
-      })
-      if (streamedMessageId === null) {
-        await streamAssistantMessage(assistantReply.content)
-      } else {
-        const targetMessageId = streamedMessageId
-        setMessages((currentMessages) =>
-          currentMessages.map((message) =>
-            message.id === targetMessageId ? { ...message, content: assistantReply.content } : message,
-          ),
-        )
-        speak(assistantReply.content)
-      }
+      await executeAgentRequest(text)
     } catch {
       const errorMessage: Message = {
         id: createMessageId(),
@@ -1472,6 +1664,7 @@ ${reply.content}`
 
       setMessages((currentMessages) => [...currentMessages, errorMessage])
     } finally {
+      agentAbortControllerRef.current = null
       setAssistantStatus('idle')
     }
   }
@@ -1512,15 +1705,11 @@ ${reply.content}`
 4. 下一步计划：给出可以执行的计划，每条要像待办事项
 5. 今日可打卡事项：给出 1-3 个今天就能做的动作
 
-文件名：${pickedFile!.name}
-
-文件内容：
-${pickedFile!.content}`
-          : `请用开发者视角分析这个文件，输出：\n1. 文件职责\n2. 关键逻辑\n3. 风险或改进点\n4. 可以怎么写进项目介绍\n\n文件名：${pickedFile!.name}\n\n文件内容：\n${pickedFile!.content}`
+${wrapUntrustedContent(pickedFile.name, pickedFile.content)}`
+          : `请用开发者视角分析这个文件，输出：\n1. 文件职责\n2. 关键逻辑\n3. 风险或改进点\n4. 可以怎么写进项目介绍\n\n${wrapUntrustedContent(pickedFile.name, pickedFile.content)}`
       const assistantReply = await createAssistantReply(prompt)
       await streamAssistantMessage(assistantReply.content)
-      const savedResult = await saveGeneratedReport(assistantReply.content, pickedFile.name)
-      await streamAssistantMessage(createWorkflowDoneMessage(savedResult))
+      queueGeneratedReport(assistantReply.content, pickedFile.name)
     } catch {
       setMessages((currentMessages) => [
         ...currentMessages,
@@ -1562,9 +1751,10 @@ ${pickedFile!.content}`
         return
       }
 
-      const fileContext = files
-        .map((file, index) => `# 文件 ${index + 1}: ${file.name}\n${file.content.slice(0, 3000)}`)
-        .join('\n\n')
+      const fileContext = wrapUntrustedCollection(files.map((file, index) => ({
+        label: `文件 ${index + 1}: ${file.name}`,
+        content: file.content.slice(0, 3000),
+      })))
       const assistantReply = await createAssistantReply(
         `用户选择读取一个文件夹内的全部文件。你是桌面 AI 管家，请把这些资料变成可执行工作流报告。
 
@@ -1579,8 +1769,7 @@ ${pickedFile!.content}`
 ${fileContext}`,
       )
       await streamAssistantMessage(assistantReply.content)
-      const savedResult = await saveGeneratedReport(assistantReply.content, `文件夹：${files.length} 个文件`)
-      await streamAssistantMessage(createWorkflowDoneMessage(savedResult))
+      queueGeneratedReport(assistantReply.content, `文件夹：${files.length} 个文件`)
     } catch {
       setMessages((currentMessages) => [
         ...currentMessages,
@@ -1646,9 +1835,10 @@ ${fileContext}`,
     }
 
     try {
-      const fileContext = files
-        .map((file, index) => `# 附件 ${index + 1}: ${file.name}\n${file.content.slice(0, 4000)}`)
-        .join('\n\n')
+      const fileContext = wrapUntrustedCollection(files.map((file, index) => ({
+        label: `附件 ${index + 1}: ${file.name}`,
+        content: file.content.slice(0, 4000),
+      })))
       const assistantReply = await createAssistantReply(
         `你是桌面 AI 管家。用户发送了 ${files.length} 个本地文件，并补充了处理要求。
 
@@ -1667,11 +1857,10 @@ ${userDescription || '无，默认请分析文件并生成可执行计划。'}
 ${fileContext}`,
       )
       await streamAssistantMessage(assistantReply.content)
-      const savedResult = await saveGeneratedReport(
+      queueGeneratedReport(
         assistantReply.content,
         files.length === 1 ? files[0].name : `${files.length} 个附件`,
       )
-      await streamAssistantMessage(createWorkflowDoneMessage(savedResult))
     } catch {
       await streamAssistantMessage('附件已读取，但 AI 分析失败。请检查模型配置或稍后再试。')
     } finally {
@@ -2036,6 +2225,19 @@ ${fileContext}`,
       return
     }
 
+    let structuredFields: Pick<CustomToolConfig, 'headers' | 'inputSchema' | 'queryParams' | 'bodyParams'>
+    try {
+      structuredFields = {
+        headers: parseOptionalJsonObject<Record<string, string>>(customToolForm.headersJson, 'Headers'),
+        inputSchema: parseOptionalJsonObject<NonNullable<CustomToolConfig['inputSchema']>>(customToolForm.inputSchemaJson, '输入 Schema'),
+        queryParams: parseOptionalJsonObject<Record<string, string>>(customToolForm.queryParamsJson, 'Query 映射'),
+        bodyParams: parseOptionalJsonObject<Record<string, string>>(customToolForm.bodyParamsJson, 'Body 映射'),
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Tool JSON 配置无效')
+      return
+    }
+
     const customTool: CustomToolConfig = {
       id: editingToolId ?? createLocalId('tool'),
       name: customToolForm.name.trim(),
@@ -2047,7 +2249,9 @@ ${fileContext}`,
       apiKeyName: customToolForm.apiKeyName.trim() || undefined,
       timeoutMs: customToolForm.timeoutMs,
       retries: customToolForm.retries,
-      version: '1.0.0',
+      version: customToolForm.version.trim() || '1.0.0',
+      responsePath: customToolForm.responsePath.trim() || undefined,
+      ...structuredFields,
       enabled: true,
     }
 
@@ -2067,6 +2271,12 @@ ${fileContext}`,
       apiKeyName: '',
       timeoutMs: 20000,
       retries: 0,
+      version: '1.0.0',
+      headersJson: '',
+      inputSchemaJson: '',
+      queryParamsJson: '',
+      bodyParamsJson: '',
+      responsePath: '',
     })
     setEditingToolId(null)
   }
@@ -2198,6 +2408,12 @@ ${fileContext}`,
       apiKeyName: tool.apiKeyName ?? '',
       timeoutMs: tool.timeoutMs ?? 20000,
       retries: tool.retries ?? 0,
+      version: tool.version ?? '1.0.0',
+      headersJson: tool.headers ? JSON.stringify(tool.headers, null, 2) : '',
+      inputSchemaJson: tool.inputSchema ? JSON.stringify(tool.inputSchema, null, 2) : '',
+      queryParamsJson: tool.queryParams ? JSON.stringify(tool.queryParams, null, 2) : '',
+      bodyParamsJson: tool.bodyParams ? JSON.stringify(tool.bodyParams, null, 2) : '',
+      responsePath: tool.responsePath ?? '',
     })
     setSettingsPage('tool')
   }
@@ -2599,6 +2815,10 @@ ${result.content}
           </span>
           <b>Metrics</b>
         </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('eval')}>
+          <span><strong>Agent Eval</strong><small>运行本地 RAG 基准，查看 Recall@5、MRR 和 NDCG。</small></span>
+          <b>70 题</b>
+        </button>
         <button className="settings-entry workspace-entry" onClick={openAuditLogs}>
           <span>
             <strong>审计日志</strong>
@@ -2630,7 +2850,7 @@ ${result.content}
         <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('reports')}>
           <span>
             <strong>报告行动中心</strong>
-            <small>查看报告，并悬浮到桌面。</small>
+            <small>查看报告，或固定为可侧边收起的桌面行动卡。</small>
           </span>
           <b>{workflowData.reports.length} 份</b>
         </button>
@@ -2701,6 +2921,10 @@ ${result.content}
       return <MetricsPanel runs={agentRuns} logs={auditLogs} />
     }
 
+    if (workspacePage === 'eval') {
+      return <EvalPanel />
+    }
+
     if (workspacePage === 'logs') {
       return (
         <AuditLogPanel
@@ -2723,7 +2947,7 @@ ${result.content}
               <p>{latestReport.summary}</p>
               <div className="report-actions">
                 <button className="panel-action-button" onClick={() => openFloatingReport(latestReport.id)} disabled={!isElectronReady}>
-                  悬浮到桌面
+                  固定到桌面边缘
                 </button>
                 <button onClick={() => deleteReport(latestReport)}>删除</button>
               </div>
@@ -2860,10 +3084,15 @@ ${result.content}
                     <button onClick={() => startProgressRecord(plan)} disabled={plan.status === 'done'}>
                       记录进度
                     </button>
+                    <button className="pin-action" onClick={() => openFloatingPlan(plan.id)} disabled={!isElectronReady}>
+                      <Pin aria-hidden="true" size={15} />固定到桌面
+                    </button>
                     <button onClick={() => togglePlanDone(plan)}>
                       {plan.status === 'done' ? '继续' : '完成'}
                     </button>
-                    <button onClick={() => deletePlan(plan.id)}>删除</button>
+                    <button className="danger-action" onClick={() => deletePlan(plan.id)} title="删除计划">
+                      <Trash2 aria-hidden="true" size={15} />删除
+                    </button>
                   </div>
                   {isPlanStale(plan) && (
                     <button className="split-plan-button" onClick={() => splitStalePlan(plan)} disabled={isThinking}>
@@ -2990,7 +3219,7 @@ ${result.content}
           <b>{todayPlans.length} 个</b>
         </button>
         <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('reports')}>
-          <span><strong>报告</strong><small>查看分析结论并悬浮到桌面。</small></span>
+          <span><strong>报告</strong><small>查看分析结论并固定为桌面行动卡。</small></span>
           <b>{workflowData.reports.length} 份</b>
         </button>
         <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('plans')}>
@@ -3103,6 +3332,31 @@ ${result.content}
 
         <MessageList messages={messages} />
 
+        {pendingReportCard && (
+          <section className="trip-result-card" aria-label="分析结果保存选项">
+            <div className="trip-result-heading">
+              <div>
+                <strong>{pendingReportCard.title}</strong>
+                <span>分析已完成，保存前由你确认</span>
+              </div>
+              <button className="icon-button" title="关闭结果卡" onClick={() => setPendingReportCard(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="trip-result-facts">
+              <span>{pendingReportCard.summary}</span>
+              <span>可提取 {pendingReportCard.planCount} 条计划</span>
+            </div>
+            <div className="trip-result-actions">
+              <button onClick={() => void downloadGeneratedReport()}><Download size={16} />下载报告</button>
+              <button onClick={() => void confirmGeneratedReport(false)}><FileText size={16} />仅保存报告</button>
+              <button className="primary" onClick={() => void confirmGeneratedReport(true)}>
+                <CalendarPlus size={16} />保存并加入计划
+              </button>
+            </div>
+          </section>
+        )}
+
         {tripResultCard && (
           <section className="trip-result-card" aria-label="出差行动卡">
             <div className="trip-result-heading">
@@ -3117,6 +3371,36 @@ ${result.content}
               <button className="primary" onClick={() => void saveTripCardToPlan()} disabled={tripResultCard.savedToPlan}>
                 <CalendarPlus size={16} />{tripResultCard.savedToPlan ? '已加入计划' : '加入计划'}
               </button>
+            </div>
+          </section>
+        )}
+
+        {(isThinking || pausedAgentRun) && (
+          <section className="agent-run-controls" aria-live="polite">
+            <div>
+              <strong>{isThinking ? 'Agent 正在执行' : '任务已暂停'}</strong>
+              <span>{isThinking ? '暂停或取消会在当前安全步骤结束后生效' : pausedAgentRun?.goal}</span>
+            </div>
+            <div className="agent-run-control-actions">
+              {isThinking ? (
+                <>
+                  <button onClick={pauseAgentRun} title="保存当前进度并暂停">
+                    <Pause aria-hidden="true" size={16} />暂停
+                  </button>
+                  <button className="danger" onClick={cancelAgentRun} title="取消本次任务">
+                    <Square aria-hidden="true" size={15} />取消
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button className="primary" onClick={() => void resumeAgentRun()}>
+                    <Play aria-hidden="true" size={16} />继续任务
+                  </button>
+                  <button className="danger" onClick={() => setPausedAgentRun(null)}>
+                    <X aria-hidden="true" size={16} />放弃
+                  </button>
+                </>
+              )}
             </div>
           </section>
         )}
@@ -3327,6 +3611,13 @@ ${result.content}
                   </span>
                   <b>{(platformConfig?.customSkills.length ?? 0) + (platformConfig?.customTools.length ?? 0)} 个</b>
                 </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('integrations')}>
+                  <span>
+                    <strong>外部服务</strong>
+                    <small>配置天气、地点和路线等业务 API。</small>
+                  </span>
+                  <b>{platformConfig?.integrations.amapApiKey ? '已配置' : '待配置'}</b>
+                </button>
                 <button className="settings-entry" onClick={() => setSettingsPage('advanced')}>
                   <span>
                     <strong>高级设置</strong>
@@ -3456,6 +3747,28 @@ ${result.content}
                     onChange={(event) => setProviderForm({ ...providerForm, apiKey: event.target.value })}
                   />
                   <button onClick={addModelProvider}>添加并启用 Provider</button>
+                </div>
+              </div>
+            )}
+
+            {settingsPage === 'integrations' && platformConfig && (
+              <div className="settings-block">
+                <h3>外部服务</h3>
+                <p className="settings-help">Key 只保存在本机，并使用 Windows 凭据加密。高德需创建“Web 服务”类型 Key。</p>
+                <div className="settings-form">
+                  <label>
+                    高德 Web 服务 Key
+                    <input
+                      type="password"
+                      value={platformConfig.integrations.amapApiKey ?? ''}
+                      placeholder="用于天气、地点解析和路线规划"
+                      onChange={(event) => setPlatformConfig({
+                        ...platformConfig,
+                        integrations: { ...platformConfig.integrations, amapApiKey: event.target.value },
+                      })}
+                    />
+                  </label>
+                  <button onClick={() => void savePlatformConfig(platformConfig)}>保存外部服务配置</button>
                 </div>
               </div>
             )}
@@ -3642,9 +3955,10 @@ ${result.content}
                     value={customToolForm.apiKeyPlacement}
                     onChange={(event) => setCustomToolForm({
                       ...customToolForm,
-                      apiKeyPlacement: event.target.value as 'bearer' | 'query' | 'header',
+                      apiKeyPlacement: event.target.value as 'none' | 'bearer' | 'query' | 'header',
                     })}
                   >
+                    <option value="none">无需鉴权</option>
                     <option value="bearer">Authorization Bearer</option>
                     <option value="query">URL 查询参数 / 模板</option>
                     <option value="header">自定义 Header</option>
@@ -3654,6 +3968,40 @@ ${result.content}
                     placeholder="Key 参数名，例如 key 或 X-API-Key"
                     onChange={(event) => setCustomToolForm({ ...customToolForm, apiKeyName: event.target.value })}
                   />
+                  <details className="tool-advanced-config">
+                    <summary>结构化参数与响应</summary>
+                    <p className="settings-help">输入框支持 JSON。映射值填写输入字段名，或使用 {'{{field}}'} 模板。响应路径示例：data.items.0。</p>
+                    <label>
+                      Tool 版本
+                      <input value={customToolForm.version} placeholder="1.0.0"
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, version: event.target.value })} />
+                    </label>
+                    <label>
+                      Headers JSON
+                      <textarea value={customToolForm.headersJson} placeholder={'{"X-App":"desktop","X-City":"{{city}}"}'}
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, headersJson: event.target.value })} />
+                    </label>
+                    <label>
+                      输入 JSON Schema
+                      <textarea value={customToolForm.inputSchemaJson} placeholder={'{"properties":{"city":{"type":"string"}},"required":["city"]}'}
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, inputSchemaJson: event.target.value })} />
+                    </label>
+                    <label>
+                      Query 参数映射
+                      <textarea value={customToolForm.queryParamsJson} placeholder={'{"city":"city","days":"days"}'}
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, queryParamsJson: event.target.value })} />
+                    </label>
+                    <label>
+                      Body 参数映射
+                      <textarea value={customToolForm.bodyParamsJson} placeholder={'{"location":"city","query":"input"}'}
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, bodyParamsJson: event.target.value })} />
+                    </label>
+                    <label>
+                      响应提取路径
+                      <input value={customToolForm.responsePath} placeholder="data.items"
+                        onChange={(event) => setCustomToolForm({ ...customToolForm, responsePath: event.target.value })} />
+                    </label>
+                  </details>
                   <label>
                     超时（毫秒）
                     <input type="number" min="1000" max="60000" value={customToolForm.timeoutMs}

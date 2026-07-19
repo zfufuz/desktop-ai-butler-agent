@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteActivity: (activityId: string) => ipcRenderer.invoke('workflow:delete-activity', activityId),
   notify: (title: string, body: string) => ipcRenderer.invoke('workflow:notify', title, body),
   openFloatingReport: (reportId: string) => ipcRenderer.invoke('workflow:open-floating-report', reportId),
+  openFloatingPlan: (planId: string) => ipcRenderer.invoke('workflow:open-floating-plan', planId),
   getExtensionsPath: () => ipcRenderer.invoke('platform:get-extensions-path'),
   openExtensionsFolder: () => ipcRenderer.invoke('platform:open-extensions-folder'),
   invokeCustomTool: (toolId: string, input: string) =>

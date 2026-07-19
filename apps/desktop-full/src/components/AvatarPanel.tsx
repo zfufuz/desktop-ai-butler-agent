@@ -12,7 +12,10 @@ function AvatarPanel({ appName, appVersion, systemInfoText, statusText }: Avatar
     <section className="avatar-panel">
       <div className="avatar-placeholder">
         <div className="avatar-brand">
-          <div className="avatar-face"><Bot aria-hidden="true" size={28} /></div>
+          <div className={`avatar-face ${statusText.includes('思考') || statusText.includes('处理') ? 'is-active' : ''}`}>
+            <Bot aria-hidden="true" size={28} />
+            <span className="avatar-signal" aria-hidden="true" />
+          </div>
           <div><div className="avatar-name">{appName}</div><div className="avatar-version">版本 {appVersion || '开发中'}</div></div>
         </div>
         <div className="avatar-status"><span className="status-dot" />{statusText}</div>
