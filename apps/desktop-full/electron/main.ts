@@ -1,12 +1,16 @@
-import { app, BrowserWindow, Notification, Tray, dialog, globalShortcut, ipcMain, safeStorage, shell } from 'electron'
+import { app, BrowserWindow, Notification, Tray, dialog, globalShortcut, ipcMain, safeStorage, screen, shell } from 'electron'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
+import mammoth from 'mammoth'
+import { PDFParse } from 'pdf-parse'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
 import { readXlsxFile } from './excel-parser.js'
+import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
+import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -25,6 +29,17 @@ type ModelProviderConfig = {
   baseUrl?: string
 }
 
+type RagConfig = {
+  embeddingEnabled: boolean
+  embeddingProviderId: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  rerankerEnabled: boolean
+  rerankerModel: string
+  rerankerBaseUrl: string
+  topK: number
+}
+
 type CustomSkillConfig = {
   id: string
   name: string
@@ -41,6 +56,16 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
+  apiKeyPlacement?: 'none' | 'bearer' | 'query' | 'header'
+  apiKeyName?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  retries?: number
+  version?: string
+  inputSchema?: ToolInputSchema
+  queryParams?: ToolRequestMapping
+  bodyParams?: ToolRequestMapping
+  responsePath?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -97,7 +122,7 @@ type ButlerWorkspaceData = {
 type StoredAgentRun = {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'blocked' | 'failed'
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
   turns: number
   startedAt: number
   finishedAt?: number
@@ -119,6 +144,9 @@ type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+  lexicalScore: number
+  semanticScore: number
+  retrievalMode: 'keyword' | 'hybrid'
 }
 
 type AuditLogLevel = 'info' | 'warn' | 'error'
@@ -150,10 +178,22 @@ type AgentPlatformConfig = {
   providers: ModelProviderConfig[]
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
+  rag: RagConfig
+  integrations: {
+    amapApiKey?: string
+  }
+  deletedBuiltinToolIds?: string[]
 }
 
 let mainWindow: BrowserWindow | null = null
 let floatingReportWindow: BrowserWindow | null = null
+let floatingReportDock: 'left' | 'right' = 'right'
+let floatingReportHidden = false
+let floatingReportMoving = false
+let floatingReportHideTimer: ReturnType<typeof setTimeout> | null = null
+let floatingReportCursorMonitor: ReturnType<typeof setInterval> | null = null
+let floatingReportLastHoverAt = 0
+const toolCircuitStates = new Map<string, { failures: number; openUntil: number }>()
 let tray: Tray | null = null
 let database: DatabaseSync | null = null
 
@@ -269,10 +309,9 @@ function readZipEntries(filePath: string) {
   return entries
 }
 
-function readDocxFile(filePath: string) {
-  const entries = readZipEntries(filePath)
-  const documentXml = entries.get('word/document.xml')?.toString('utf8') ?? ''
-  return stripXmlTags(documentXml)
+async function readDocxFile(filePath: string) {
+  const result = await mammoth.extractRawText({ path: filePath })
+  return result.value.trim() || 'DOCX 中没有可提取的正文文本。'
 }
 
 function readPptxFile(filePath: string) {
@@ -284,19 +323,15 @@ function readPptxFile(filePath: string) {
     .join('\n\n')
 }
 
-function readPdfFile(filePath: string) {
-  const raw = fs.readFileSync(filePath).toString('latin1')
-  const literalTexts = [...raw.matchAll(/\(([^()]{2,500})\)\s*Tj/g)].map((match) => match[1])
-  const arrayTexts = [...raw.matchAll(/\[((?:\([^()]{1,200}\)\s*)+)\]\s*TJ/g)].map((match) =>
-    [...match[1].matchAll(/\(([^()]{1,200})\)/g)].map((textMatch) => textMatch[1]).join(''),
-  )
-  const text = [...literalTexts, ...arrayTexts]
-    .join('\n')
-    .replace(/\\([()\\])/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return text || '已识别为 PDF 文件，但当前内置解析器没有抽取到可读文本。扫描版 PDF 需要后续接 OCR 或专业 PDF 解析库。'
+async function readPdfFile(filePath: string) {
+  const parser = new PDFParse({ data: fs.readFileSync(filePath) })
+  try {
+    const result = await parser.getText()
+    const text = result.text.trim()
+    return text || 'PDF 中没有文本层；这通常是扫描件，需要配置 OCR Tool 后才能识别。'
+  } finally {
+    await parser.destroy()
+  }
 }
 
 function readImageInfo(filePath: string) {
@@ -334,13 +369,13 @@ async function readSupportedFile(filePath: string): Promise<PickedTextFile> {
   if (plainTextExtensions.has(extension)) {
     content = fs.readFileSync(filePath, 'utf8')
   } else if (extension === '.docx') {
-    content = readDocxFile(filePath)
+    content = await readDocxFile(filePath)
   } else if (extension === '.xlsx') {
     content = await readXlsxFile(filePath)
   } else if (extension === '.pptx') {
     content = readPptxFile(filePath)
   } else if (extension === '.pdf') {
-    content = readPdfFile(filePath)
+    content = await readPdfFile(filePath)
   } else if (imageExtensions.has(extension)) {
     content = readImageInfo(filePath)
   } else {
@@ -554,6 +589,10 @@ function initializeDatabase() {
       document_name TEXT NOT NULL,
       chunk_index INTEGER NOT NULL,
       content TEXT NOT NULL,
+      embedding_blob BLOB,
+      embedding_dimensions INTEGER,
+      embedding_model TEXT,
+      embedding_updated_at INTEGER,
       FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);
@@ -569,6 +608,18 @@ function initializeDatabase() {
   const planColumns = new Set(
     (database.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>).map((column) => column.name),
   )
+  const knowledgeChunkColumns = new Set(
+    (database.prepare('PRAGMA table_info(knowledge_chunks)').all() as Array<{ name: string }>).map((column) => column.name),
+  )
+  const knowledgeChunkMigrations = [
+    ['embedding_blob', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_blob BLOB'],
+    ['embedding_dimensions', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_dimensions INTEGER'],
+    ['embedding_model', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_model TEXT'],
+    ['embedding_updated_at', 'ALTER TABLE knowledge_chunks ADD COLUMN embedding_updated_at INTEGER'],
+  ] as const
+  for (const [column, migration] of knowledgeChunkMigrations) {
+    if (!knowledgeChunkColumns.has(column)) database.exec(migration)
+  }
   const planMigrations = [
     ['priority', "ALTER TABLE plans ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'"],
     ['due_date', 'ALTER TABLE plans ADD COLUMN due_date TEXT'],
@@ -781,7 +832,7 @@ function saveAgentRun(value: unknown) {
     throw new Error('Agent run is missing required fields')
   }
 
-  const allowedStatuses = new Set<StoredAgentRun['status']>(['running', 'completed', 'blocked', 'failed'])
+  const allowedStatuses = new Set<StoredAgentRun['status']>(['queued', 'running', 'paused', 'cancelled', 'completed', 'blocked', 'failed'])
   const savedRun: StoredAgentRun = {
     id: run.id.slice(0, 120),
     goal: run.goal.slice(0, 4000),
@@ -804,7 +855,7 @@ function saveAgentRun(value: unknown) {
     action: 'agent.run.save',
     summary: `Agent 任务${savedRun.status === 'completed' ? '完成' : savedRun.status === 'failed' ? '失败' : savedRun.status === 'blocked' ? '受阻' : '运行中'}：${savedRun.goal.slice(0, 120)}`,
     detail: savedRun.error,
-    status: savedRun.status === 'failed' ? 'failure' : savedRun.status === 'running' ? 'pending' : 'success',
+    status: savedRun.status === 'failed' ? 'failure' : ['queued', 'running', 'paused'].includes(savedRun.status) ? 'pending' : 'success',
     runId: savedRun.id,
     durationMs: savedRun.finishedAt ? savedRun.finishedAt - savedRun.startedAt : undefined,
     metadata: { turns: savedRun.turns, observations: savedRun.observations.length },
@@ -881,7 +932,98 @@ function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
   }
 }
 
-function upsertKnowledgeDocument(value: unknown) {
+function getEmbeddingRuntime() {
+  const config = readPlatformConfig()
+  if (!config.rag.embeddingEnabled) return null
+  const provider = config.providers.find((item) => item.id === config.rag.embeddingProviderId)
+  if (!provider?.apiKey || provider.type === 'mock') return null
+  return {
+    provider,
+    model: config.rag.embeddingModel.trim(),
+    endpoint: config.rag.embeddingBaseUrl.trim(),
+  }
+}
+
+async function requestEmbeddingVectors(texts: string[]) {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime || texts.length === 0) return null
+  const endpoint = validateHttpEndpoint(runtime.endpoint, 'Embedding Provider')
+  const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(60_000),
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${runtime.provider.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ model: runtime.model, input: texts }),
+  })
+  if (!response.ok) {
+    throw new Error(`Embedding provider request failed: ${response.status}`)
+  }
+  const payload = await response.json() as { data?: Array<{ index?: number; embedding?: number[] }> }
+  const ordered = [...(payload.data ?? [])].sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+  const vectors = ordered.map((item) => item.embedding).filter((item): item is number[] => Array.isArray(item))
+  if (vectors.length !== texts.length || vectors.some((vector) => vector.length === 0)) {
+    throw new Error('Embedding provider returned an invalid vector count')
+  }
+  return { vectors, model: runtime.model }
+}
+
+async function rerankWithModel(query: string, candidates: ReturnType<typeof rerankHybridCandidates>) {
+  const config = readPlatformConfig()
+  if (!config.rag.rerankerEnabled || candidates.length === 0) return null
+  const provider = config.providers.find((item) => item.id === config.rag.embeddingProviderId)
+  if (!provider?.apiKey || provider.type === 'mock') return null
+  const endpoint = validateHttpEndpoint(config.rag.rerankerBaseUrl.trim(), 'Reranker Provider')
+  const response = await fetch(endpoint, {
+    signal: AbortSignal.timeout(30_000),
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${provider.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: config.rag.rerankerModel.trim(),
+      query,
+      documents: candidates.map((candidate) => candidate.content),
+      top_n: candidates.length,
+      return_documents: false,
+    }),
+  })
+  if (!response.ok) throw new Error(`Reranker provider request failed: ${response.status}`)
+  const payload = await response.json() as { results?: Array<{ index?: number; relevance_score?: number }> }
+  const ranked = (payload.results ?? [])
+    .filter((item): item is { index: number; relevance_score?: number } => (
+      Number.isInteger(item.index) && Number(item.index) >= 0 && Number(item.index) < candidates.length
+    ))
+    .map((item) => ({ ...candidates[item.index], modelRerankScore: Number(item.relevance_score ?? 0) }))
+  return ranked.length === candidates.length ? ranked : null
+}
+
+async function indexDocumentEmbeddings(documentId: string, chunks: string[]) {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime || chunks.length === 0) return 0
+  const db = initializeDatabase()
+  let indexed = 0
+  for (let start = 0; start < chunks.length; start += 32) {
+    const batch = chunks.slice(start, start + 32)
+    const result = await requestEmbeddingVectors(batch)
+    if (!result) break
+    const update = db.prepare(
+      `UPDATE knowledge_chunks
+       SET embedding_blob = ?, embedding_dimensions = ?, embedding_model = ?, embedding_updated_at = ?
+       WHERE document_id = ? AND chunk_index = ?`,
+    )
+    result.vectors.forEach((vector, offset) => {
+      const blob = Buffer.from(encodeEmbeddingVector(vector))
+      update.run(blob, vector.length, result.model, Date.now(), documentId, start + offset)
+      indexed += 1
+    })
+  }
+  return indexed
+}
+
+async function upsertKnowledgeDocument(value: unknown) {
   const document = normalizeKnowledgeDocument(value)
   const documentId = String(document.id)
   const chunks = chunkKnowledgeContent(document.content)
@@ -911,13 +1053,21 @@ function upsertKnowledgeDocument(value: unknown) {
     writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料入库失败：${document.name}`, detail: error, status: 'failure' })
     throw error
   }
-  writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料已入库：${document.name}`, metadata: { documentId, chunks: chunks.length, characters: document.content.length } })
-  return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length }
+  let embeddingCount = 0
+  try {
+    embeddingCount = await indexDocumentEmbeddings(documentId, chunks)
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.embedding', summary: `向量索引失败，已保留关键词索引：${document.name}`, detail: error, status: 'failure', level: 'warn', metadata: { documentId, chunks: chunks.length } })
+  }
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.upsert', summary: `资料已入库：${document.name}`, metadata: { documentId, chunks: chunks.length, embeddings: embeddingCount, characters: document.content.length } })
+  return { id: documentId, name: document.name, createdAt: document.createdAt, chunkCount: chunks.length, embeddingCount }
 }
 
-function syncKnowledgeDocuments(values: unknown) {
+async function syncKnowledgeDocuments(values: unknown) {
   if (!Array.isArray(values)) return []
-  return values.slice(0, 50).map(upsertKnowledgeDocument)
+  const results = []
+  for (const value of values.slice(0, 50)) results.push(await upsertKnowledgeDocument(value))
+  return results
 }
 
 function listKnowledgeDocuments() {
@@ -925,13 +1075,31 @@ function listKnowledgeDocuments() {
     .prepare(
       `SELECT documents.id, documents.name, documents.created_at AS createdAt,
         documents.updated_at AS updatedAt, COUNT(chunks.id) AS chunkCount,
-        LENGTH(documents.content) AS characterCount
+        LENGTH(documents.content) AS characterCount,
+        SUM(CASE WHEN chunks.embedding_blob IS NOT NULL THEN 1 ELSE 0 END) AS embeddingCount
       FROM knowledge_documents AS documents
       LEFT JOIN knowledge_chunks AS chunks ON chunks.document_id = documents.id
       GROUP BY documents.id
       ORDER BY documents.updated_at DESC`,
     )
     .all()
+}
+
+async function rebuildKnowledgeEmbeddings() {
+  const runtime = getEmbeddingRuntime()
+  if (!runtime) throw new Error('请先启用 Embedding 并选择一个带 API Key 的 Provider')
+  const rows = initializeDatabase()
+    .prepare('SELECT DISTINCT document_id AS documentId FROM knowledge_chunks ORDER BY document_id')
+    .all() as Array<{ documentId: string }>
+  let indexed = 0
+  for (const row of rows) {
+    const chunks = initializeDatabase()
+      .prepare('SELECT content FROM knowledge_chunks WHERE document_id = ? ORDER BY chunk_index')
+      .all(row.documentId) as Array<{ content: string }>
+    indexed += await indexDocumentEmbeddings(row.documentId, chunks.map((chunk) => chunk.content))
+  }
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.rebuild-embeddings', summary: `向量索引重建完成：${indexed} 个片段`, metadata: { documents: rows.length, embeddings: indexed, model: runtime.model } })
+  return { documents: rows.length, embeddings: indexed, model: runtime.model }
 }
 
 function deleteKnowledgeDocument(documentId: string) {
@@ -951,15 +1119,18 @@ function deleteKnowledgeDocument(documentId: string) {
   }
 }
 
-function searchKnowledge(query: string, requestedLimit = 6): KnowledgeSearchResult[] {
+async function searchKnowledge(query: string, requestedLimit = 5): Promise<KnowledgeSearchResult[]> {
   const terms = createKnowledgeSearchTerms(query)
   if (terms.length === 0) return []
-  const limit = Math.max(1, Math.min(Number(requestedLimit) || 6, 12))
+  const configuredLimit = readPlatformConfig().rag.topK
+  const limit = Math.max(1, Math.min(Number(requestedLimit) || configuredLimit, 10))
+  const candidateLimit = Math.max(20, limit * 6)
   const db = initializeDatabase()
   const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
+  let lexicalRows: Array<Omit<KnowledgeSearchResult, 'score' | 'lexicalScore' | 'semanticScore' | 'retrievalMode'> & { rank?: number }> = []
 
   try {
-    const rows = db
+    lexicalRows = db
       .prepare(
         `SELECT document_id AS documentId, document_name AS documentName,
           CAST(chunk_index AS INTEGER) AS chunkIndex, content,
@@ -968,24 +1139,75 @@ function searchKnowledge(query: string, requestedLimit = 6): KnowledgeSearchResu
         WHERE knowledge_chunks_fts MATCH ?
         ORDER BY rank ASC LIMIT ?`,
       )
-      .all(ftsQuery, limit) as Array<KnowledgeSearchResult & { rank: number }>
-    if (rows.length > 0) {
-      return rows.map(({ rank, ...row }) => ({ ...row, score: Number((-rank).toFixed(6)) }))
-    }
+      .all(ftsQuery, candidateLimit) as typeof lexicalRows
   } catch {
     // Fall back to LIKE search when a platform FTS tokenizer cannot parse a query.
   }
 
-  const fallbackTerms = terms.slice(0, 8)
-  const where = fallbackTerms.map(() => 'content LIKE ?').join(' OR ')
-  const rows = db
-    .prepare(
-      `SELECT document_id AS documentId, document_name AS documentName,
-        chunk_index AS chunkIndex, content
-      FROM knowledge_chunks WHERE ${where} LIMIT ?`,
-    )
-    .all(...fallbackTerms.map((term) => `%${term}%`), limit) as Array<Omit<KnowledgeSearchResult, 'score'>>
-  return rows.map((row) => ({ ...row, score: 0 }))
+  if (lexicalRows.length === 0) {
+    const fallbackTerms = terms.slice(0, 8)
+    const where = fallbackTerms.map(() => 'content LIKE ?').join(' OR ')
+    lexicalRows = db
+      .prepare(
+        `SELECT document_id AS documentId, document_name AS documentName,
+          chunk_index AS chunkIndex, content
+        FROM knowledge_chunks WHERE ${where} LIMIT ?`,
+      )
+      .all(...fallbackTerms.map((term) => `%${term}%`), candidateLimit) as typeof lexicalRows
+  }
+
+  const candidates = new Map<string, HybridCandidate>()
+  lexicalRows.forEach((row, lexicalRank) => {
+    const key = `${row.documentId}:${row.chunkIndex}`
+    candidates.set(key, { ...row, lexicalRank })
+  })
+
+  try {
+    const queryEmbedding = await requestEmbeddingVectors([query])
+    if (queryEmbedding) {
+      const vectorRows = db
+        .prepare(
+          `SELECT document_id AS documentId, document_name AS documentName,
+            chunk_index AS chunkIndex, content, embedding_blob AS embeddingBlob,
+            embedding_dimensions AS embeddingDimensions
+           FROM knowledge_chunks
+           WHERE embedding_blob IS NOT NULL AND embedding_model = ?`,
+        )
+        .all(queryEmbedding.model) as Array<Omit<HybridCandidate, 'vectorScore'> & { embeddingBlob: Uint8Array; embeddingDimensions: number }>
+      const rankedVectors = vectorRows
+        .map((row) => {
+          const vector = decodeEmbeddingVector(row.embeddingBlob, row.embeddingDimensions)
+          return { ...row, vectorScore: cosineSimilarity(queryEmbedding.vectors[0], vector) }
+        })
+        .sort((left, right) => right.vectorScore - left.vectorScore)
+        .slice(0, candidateLimit)
+      rankedVectors.forEach(({ embeddingBlob: _embeddingBlob, embeddingDimensions: _embeddingDimensions, ...row }, vectorRank) => {
+        const key = `${row.documentId}:${row.chunkIndex}`
+        candidates.set(key, { ...(candidates.get(key) ?? row), vectorRank, vectorScore: row.vectorScore })
+      })
+    }
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.vector-search', summary: '向量检索失败，已降级为 BM25', detail: error, status: 'failure', level: 'warn' })
+  }
+
+  const locallyRanked = rerankHybridCandidates([...candidates.values()], terms, Math.min(candidateLimit, 20))
+  let ranked = locallyRanked
+  try {
+    ranked = (await rerankWithModel(query, locallyRanked)) ?? locallyRanked
+  } catch (error) {
+    writeAuditLog({ category: 'knowledge', action: 'knowledge.rerank', summary: '模型重排失败，已降级为本地重排', detail: error, status: 'failure', level: 'warn' })
+  }
+
+  return ranked.slice(0, limit).map((result) => ({
+    documentId: result.documentId,
+    documentName: result.documentName,
+    chunkIndex: result.chunkIndex,
+    content: compressKnowledgeContext(result.content, terms),
+    score: result.score,
+    lexicalScore: result.lexicalScore,
+    semanticScore: result.semanticScore,
+    retrievalMode: result.retrievalMode,
+  }))
 }
 
 function createId(prefix: string) {
@@ -1231,26 +1453,149 @@ function appendActivity(data: ButlerWorkspaceData, activity: Omit<ButlerActivity
   ].slice(0, 80)
 }
 
-function openFloatingReport(report: ButlerReport) {
+const FLOATING_REPORT_WIDTH = 336
+const FLOATING_REPORT_HEIGHT = 326
+const FLOATING_REPORT_MARGIN = 12
+const FLOATING_REPORT_HANDLE = 28
+
+function clearFloatingReportHideTimer() {
+  if (floatingReportHideTimer) clearTimeout(floatingReportHideTimer)
+  floatingReportHideTimer = null
+}
+
+function getFloatingReportBounds(hidden: boolean) {
+  if (!floatingReportWindow) return null
+  const bounds = floatingReportWindow.getBounds()
+  const workArea = screen.getDisplayMatching(bounds).workArea
+  const y = Math.max(workArea.y + FLOATING_REPORT_MARGIN, Math.min(bounds.y, workArea.y + workArea.height - bounds.height - FLOATING_REPORT_MARGIN))
+  const width = hidden ? FLOATING_REPORT_HANDLE : FLOATING_REPORT_WIDTH
+  const x = floatingReportDock === 'right'
+    ? workArea.x + workArea.width - width
+    : workArea.x
+  return { x, y, width, height: bounds.height }
+}
+
+function moveFloatingReport(hidden: boolean) {
+  if (!floatingReportWindow || floatingReportWindow.isDestroyed()) return
+  const bounds = getFloatingReportBounds(hidden)
+  if (!bounds) return
+  floatingReportMoving = true
+  floatingReportHidden = hidden
+  floatingReportWindow.setBounds(bounds, false)
+  void floatingReportWindow.webContents.executeJavaScript(`document.body.dataset.dock = '${floatingReportDock}'`)
+  setTimeout(() => { floatingReportMoving = false }, 120)
+}
+
+function scheduleFloatingReportHide(delay = 900) {
+  clearFloatingReportHideTimer()
+  floatingReportHideTimer = setTimeout(() => moveFloatingReport(true), delay)
+}
+
+function stopFloatingReportCursorMonitor() {
+  if (floatingReportCursorMonitor) clearInterval(floatingReportCursorMonitor)
+  floatingReportCursorMonitor = null
+}
+
+function startFloatingReportCursorMonitor() {
+  stopFloatingReportCursorMonitor()
+  floatingReportLastHoverAt = Date.now()
+  floatingReportCursorMonitor = setInterval(() => {
+    if (!floatingReportWindow || floatingReportWindow.isDestroyed()) {
+      stopFloatingReportCursorMonitor()
+      return
+    }
+    const point = screen.getCursorScreenPoint()
+    const bounds = floatingReportWindow.getBounds()
+    const inside = point.x >= bounds.x && point.x < bounds.x + bounds.width
+      && point.y >= bounds.y && point.y < bounds.y + bounds.height
+    if (inside) {
+      floatingReportLastHoverAt = Date.now()
+      clearFloatingReportHideTimer()
+      if (floatingReportHidden) expandFloatingReport()
+      return
+    }
+    if (!floatingReportHidden && Date.now() - floatingReportLastHoverAt > 1600) moveFloatingReport(true)
+  }, 160)
+}
+
+function expandFloatingReport() {
+  clearFloatingReportHideTimer()
+  moveFloatingReport(false)
+}
+
+function getFloatingReportActions(value: string) {
+  const candidates = value.split(/\r?\n/)
+    .map((line) => formatFloatingDisplayText(line.trim().replace(/^#{1,3}\s+/, '').replace(/^\d+[.、]\s*/, '').replace(/^[-*•]\s*/, '').replace(/\*\*/g, '')))
+    .filter((line) => line.length >= 5
+      && !/^(报告摘要|关键发现|风险提醒|下一步计划|今日可打卡事项|交通建议|住宿与预算建议)[:：]?$/.test(line)
+      && !/配置.*(?:Tool|工具)|未配置.*(?:Tool|工具)|API.*(?:错误|问题|失败)|无法确定.*(?:交通|天气)|ENGINE_RESPONSE|infocode/i.test(line))
+  const actionable = candidates.filter((line) => /建议|需要|准备|检查|确认|预订|联系|完成|下一步|提醒/.test(line))
+  const selected = [...actionable, ...candidates.filter((line) => !actionable.includes(line))]
+    .filter((line, index, lines) => lines.indexOf(line) === index)
+    .slice(0, 3)
+  return selected.map((line) => `<li>${escapeHtml(line.slice(0, 92))}${line.length > 92 ? '…' : ''}</li>`).join('')
+}
+
+function formatFloatingDisplayText(value: string) {
+  return value.replace(/\b(20\d{2})(\d{2})(\d{2})\b/g, '$1-$2-$3')
+}
+
+function openFloatingReport(report: ButlerReport, kind: 'report' | 'plan' = 'report', progress?: number) {
   floatingReportWindow?.close()
 
+  const workArea = screen.getPrimaryDisplay().workArea
+  floatingReportDock = 'right'
+  floatingReportHidden = false
+
   floatingReportWindow = new BrowserWindow({
-    title: `报告：${report.title}`,
-    width: 380,
-    height: 520,
-    minWidth: 320,
-    minHeight: 360,
+    title: report.title,
+    width: FLOATING_REPORT_WIDTH,
+    height: Math.min(FLOATING_REPORT_HEIGHT, workArea.height - 32),
+    x: workArea.x + workArea.width - FLOATING_REPORT_WIDTH,
+    y: workArea.y + 72,
     alwaysOnTop: true,
-    resizable: true,
-    frame: true,
+    skipTaskbar: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    backgroundColor: '#00000000',
     webPreferences: {
+      preload: path.join(__dirname, 'floating-report-preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
   })
 
+  floatingReportWindow.setAlwaysOnTop(true, 'floating')
+
+  floatingReportWindow.on('moved', () => {
+    if (!floatingReportWindow || floatingReportMoving || floatingReportHidden) return
+    const bounds = floatingReportWindow.getBounds()
+    const display = screen.getDisplayMatching(bounds)
+    const leftDistance = Math.abs(bounds.x - display.workArea.x)
+    const rightDistance = Math.abs(bounds.x + bounds.width - (display.workArea.x + display.workArea.width))
+    if (Math.min(leftDistance, rightDistance) <= 72) {
+      floatingReportDock = leftDistance < rightDistance ? 'left' : 'right'
+      expandFloatingReport()
+      scheduleFloatingReportHide(1800)
+    }
+  })
+
   floatingReportWindow.on('closed', () => {
+    clearFloatingReportHideTimer()
+    stopFloatingReportCursorMonitor()
     floatingReportWindow = null
+  })
+
+  floatingReportWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('butler-widget://')) return
+    event.preventDefault()
+    if (url.startsWith('butler-widget://collapse')) moveFloatingReport(true)
+    if (url.startsWith('butler-widget://close')) floatingReportWindow?.close()
   })
 
   const html = `<!doctype html>
@@ -1258,26 +1603,70 @@ function openFloatingReport(report: ButlerReport) {
   <head>
     <meta charset="UTF-8" />
     <style>
-      :root { color: #0f172a; background: #f8fafc; font-family: "Segoe UI", system-ui, sans-serif; }
+      :root { color: #17211f; background: transparent; font-family: "Segoe UI", system-ui, sans-serif; }
       * { box-sizing: border-box; }
-      body { margin: 0; padding: 18px; overflow: auto; }
-      .eyebrow { color: #0f766e; font-size: 11px; font-weight: 900; text-transform: uppercase; }
-      h1 { margin: 6px 0 10px; font-size: 20px; line-height: 1.25; }
-      .summary { margin: 0 0 14px; padding: 12px; border: 1px solid rgba(20, 184, 166, 0.24); border-radius: 8px; background: #ecfeff; line-height: 1.6; }
-      pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; font-family: inherit; }
-      footer { margin-top: 16px; color: #64748b; font-size: 12px; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+      body { padding: 8px; }
+      .edge-rail { position: fixed; z-index: 20; top: 54px; bottom: 54px; width: 10px; border-radius: 8px; background: #14b8a6; box-shadow: 0 8px 24px rgba(15,118,110,.32); }
+      .edge-rail.left { left: 1px; }
+      .edge-rail.right { right: 1px; }
+      body[data-dock="right"] .edge-rail.right, body[data-dock="left"] .edge-rail.left { display: none; }
+      .widget { height: 100%; overflow: hidden; border: 1px solid rgba(100,116,139,.22); border-radius: 14px; background: rgba(250,252,252,.98); box-shadow: 0 22px 56px rgba(15,23,42,.22); }
+      header { -webkit-app-region: drag; display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 54px; border-bottom: 1px solid rgba(148,163,184,.2); padding: 10px 12px 10px 16px; }
+      .identity { min-width: 0; display: flex; align-items: center; gap: 10px; }
+      .mark { width: 28px; height: 28px; display: grid; place-items: center; flex: none; border-radius: 8px; background: #0f766e; color: white; font-size: 13px; font-weight: 900; }
+      .identity div { min-width: 0; }
+      .eyebrow { color: #0f766e; font-size: 9px; font-weight: 900; text-transform: uppercase; }
+      .title { overflow: hidden; color: #17211f; font-size: 13px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+      .window-actions { -webkit-app-region: no-drag; display: flex; gap: 5px; }
+      .window-actions button { width: 30px; height: 30px; border: 1px solid rgba(148,163,184,.25); border-radius: 8px; background: white; color: #475569; cursor: pointer; font-size: 17px; }
+      .window-actions button:hover { border-color: rgba(20,184,166,.5); color: #0f766e; }
+      main { height: calc(100% - 54px); overflow: hidden; padding: 14px 16px; }
+      .summary { display: -webkit-box; overflow: hidden; margin: 0 0 12px; border-left: 3px solid #14b8a6; border-radius: 0 8px 8px 0; background: #ecfdfb; padding: 9px 10px; color: #28534e; font-size: 12px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+      .progress { height: 5px; overflow: hidden; margin: -4px 0 12px; border-radius: 5px; background: #dbe6e4; }
+      .progress span { display: block; height: 100%; border-radius: inherit; background: #14b8a6; }
+      h2 { margin: 0 0 7px; color: #17211f; font-size: 12px; }
+      ul { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+      li { position: relative; padding-left: 13px; color: #40504c; font-size: 11px; line-height: 1.45; }
+      li::before { content: ''; position: absolute; top: 6px; left: 0; width: 5px; height: 5px; border-radius: 50%; background: #14b8a6; }
+      footer { position: absolute; right: 18px; bottom: 13px; left: 18px; border-top: 1px solid rgba(148,163,184,.18); padding-top: 7px; color: #94a3b8; font-size: 9px; }
     </style>
   </head>
-  <body>
-    <div class="eyebrow">Floating Report</div>
-    <h1>${escapeHtml(report.title)}</h1>
-    <p class="summary">${escapeHtml(report.summary)}</p>
-    <pre>${escapeHtml(report.content)}</pre>
-    <footer>${new Date(report.createdAt).toLocaleString('zh-CN')}</footer>
+  <body data-dock="right">
+    <div class="edge-rail left"></div><div class="edge-rail right"></div>
+    <section class="widget">
+      <header>
+        <div class="identity"><span class="mark">AI</span><div><div class="eyebrow">${kind === 'plan' ? '桌面计划卡' : '桌面行动卡'}</div><div class="title">${escapeHtml(report.title)}</div></div></div>
+        <div class="window-actions"><button id="collapse" title="收进屏幕侧边">‹</button><button id="close" title="关闭">×</button></div>
+      </header>
+      <main>
+        <div class="summary">${escapeHtml(formatFloatingDisplayText(report.summary.slice(0, 150)))}</div>
+        ${kind === 'plan' ? `<div class="progress" title="完成度 ${Math.max(0, Math.min(progress ?? 0, 100))}%"><span style="width:${Math.max(0, Math.min(progress ?? 0, 100))}%"></span></div>` : ''}
+        <h2>接下来</h2>
+        <ul>${getFloatingReportActions(report.content)}</ul>
+        <footer>${kind === 'plan' ? '完整计划保存在计划跟踪' : '完整报告保存在管家工作台'} · ${new Date(report.createdAt).toLocaleDateString('zh-CN')}</footer>
+      </main>
+    </section>
+    <script>
+      const bridge = window.floatingReport
+      document.addEventListener('pointermove', () => bridge?.activity())
+      document.addEventListener('mouseenter', () => bridge?.activity())
+      document.addEventListener('mouseleave', () => bridge?.leave())
+      document.getElementById('collapse').addEventListener('click', () => {
+        if (bridge) bridge.collapse(); else location.href = 'butler-widget://collapse'
+      })
+      document.getElementById('close').addEventListener('click', () => {
+        if (bridge) bridge.close(); else location.href = 'butler-widget://close'
+      })
+    </script>
   </body>
 </html>`
 
   floatingReportWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  floatingReportWindow.webContents.once('did-finish-load', () => {
+    startFloatingReportCursorMonitor()
+    scheduleFloatingReportHide(2800)
+  })
 }
 
 function escapeHtml(value: string) {
@@ -1359,6 +1748,12 @@ function parseExtensionTool(filePath: string): CustomToolConfig | null {
       endpoint: parsed.endpoint.trim(),
       method: parsed.method === 'GET' ? 'GET' : 'POST',
       apiKey: parsed.apiKey?.trim() || undefined,
+      apiKeyPlacement: parsed.apiKeyPlacement ?? 'bearer',
+      apiKeyName: parsed.apiKeyName?.trim() || undefined,
+      headers: parsed.headers,
+      timeoutMs: parsed.timeoutMs,
+      retries: parsed.retries,
+      version: parsed.version?.trim() || '1.0.0',
       enabled: parsed.enabled !== false,
       source: 'extension',
     }
@@ -1387,6 +1782,7 @@ function scanExtensionConfigs() {
 
 function createDefaultConfig(): AgentPlatformConfig {
   const zhipuApiKey = localEnv.ZHIPU_API_KEY ?? ''
+  const amapApiKey = localEnv.AMAP_API_KEY ?? ''
   const zhipuModel = localEnv.ZHIPU_MODEL ?? 'glm-4-flash'
   const providers: ModelProviderConfig[] = [
     {
@@ -1409,7 +1805,44 @@ function createDefaultConfig(): AgentPlatformConfig {
     activeProviderId: zhipuApiKey ? 'zhipu-default' : 'mock',
     providers,
     customSkills: [],
-    customTools: [],
+    customTools: [
+      {
+        id: 'builtin-amap-geocode',
+        name: '高德地点解析',
+        description: '把城市、地址、车站、机场或酒店名称转换为经纬度，供路线规划使用。',
+        endpoint: 'https://restapi.amap.com/v3/geocode/geo?address={{input}}&key={{apiKey}}',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
+      },
+      {
+        id: 'builtin-amap-weather',
+        name: '高德天气查询',
+        description: '查询中国城市当前天气和未来天气预报。输入应包含城市名称和日期要求。',
+        endpoint: 'https://restapi.amap.com/v3/weather/weatherInfo?city={{city}}&extensions=all&key={{apiKey}}',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 12000, retries: 1, version: '1.0.0', enabled: true,
+      },
+      {
+        id: 'builtin-amap-route',
+        name: '高德路线规划',
+        description: '根据起点和终点经纬度查询驾车路线、距离与预计耗时。输入格式：起点经度,纬度 到 终点经度,纬度。',
+        endpoint: 'https://restapi.amap.com/v5/direction/driving?origin={{origin}}&destination={{destination}}&key={{apiKey}}&show_fields=cost',
+        method: 'GET', apiKey: amapApiKey || undefined, apiKeyPlacement: 'query', apiKeyName: 'key',
+        timeoutMs: 15000, retries: 1, version: '1.0.0', enabled: true,
+      },
+    ],
+    integrations: { amapApiKey: amapApiKey || undefined },
+    deletedBuiltinToolIds: [],
+    rag: {
+      embeddingEnabled: false,
+      embeddingProviderId: 'zhipu-default',
+      embeddingModel: 'embedding-3',
+      embeddingBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/embeddings',
+      rerankerEnabled: false,
+      rerankerModel: 'rerank',
+      rerankerBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/rerank',
+      topK: 5,
+    },
   }
 }
 
@@ -1434,6 +1867,26 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
   const activeProviderId = providers.some((provider) => provider.id === savedConfig.activeProviderId)
     ? savedConfig.activeProviderId ?? defaultConfig.activeProviderId
     : defaultConfig.activeProviderId
+  const integrations = {
+    ...defaultConfig.integrations,
+    ...(savedConfig.integrations ?? {}),
+  }
+
+  const deletedBuiltinToolIds = savedConfig.deletedBuiltinToolIds ?? []
+  const defaultToolMap = new Map(defaultConfig.customTools.map((tool) => [tool.id, tool]))
+  const mergedManualTools = new Map<string, CustomToolConfig>()
+  for (const tool of savedConfig.customTools ?? []) {
+    if (tool.id.startsWith('extension:')) continue
+    const builtin = defaultToolMap.get(tool.id)
+    mergedManualTools.set(tool.id, builtin ? {
+      ...builtin,
+      ...tool,
+      apiKey: integrations.amapApiKey || tool.apiKey || builtin.apiKey,
+    } : tool)
+  }
+  for (const tool of defaultConfig.customTools) {
+    if (!deletedBuiltinToolIds.includes(tool.id) && !mergedManualTools.has(tool.id)) mergedManualTools.set(tool.id, tool)
+  }
 
   return {
     activeProviderId,
@@ -1442,10 +1895,14 @@ function mergeConfig(savedConfig: Partial<AgentPlatformConfig> | null): AgentPla
       ...(savedConfig.customSkills ?? []).filter((skill) => !skill.id.startsWith('extension:')),
       ...extensionConfig.customSkills,
     ],
-    customTools: [
-      ...(savedConfig.customTools ?? []).filter((tool) => !tool.id.startsWith('extension:')),
-      ...extensionConfig.customTools,
-    ],
+    customTools: [...mergedManualTools.values(), ...extensionConfig.customTools],
+    integrations,
+    deletedBuiltinToolIds,
+    rag: {
+      ...defaultConfig.rag,
+      ...(savedConfig.rag ?? {}),
+      topK: Math.max(1, Math.min(Number(savedConfig.rag?.topK) || defaultConfig.rag.topK, 10)),
+    },
   }
 }
 
@@ -1478,6 +1935,10 @@ function decryptPlatformConfig(config: Partial<AgentPlatformConfig>): Partial<Ag
       ...tool,
       apiKey: decryptSecret(tool.apiKey),
     })),
+    integrations: config.integrations ? {
+      ...config.integrations,
+      amapApiKey: decryptSecret(config.integrations.amapApiKey),
+    } : undefined,
   }
 }
 
@@ -1492,13 +1953,19 @@ function encryptPlatformConfig(config: AgentPlatformConfig): AgentPlatformConfig
       ...tool,
       apiKey: encryptSecret(tool.apiKey),
     })),
+    integrations: {
+      ...config.integrations,
+      amapApiKey: encryptSecret(config.integrations.amapApiKey),
+    },
   }
 }
 
 function hasPlaintextSecrets(config: Partial<AgentPlatformConfig>) {
-  return [...(config.providers ?? []), ...(config.customTools ?? [])].some(
+  const hasItemSecret = [...(config.providers ?? []), ...(config.customTools ?? [])].some(
     (item) => Boolean(item.apiKey) && !item.apiKey?.startsWith(SAFE_STORAGE_PREFIX),
   )
+  const amapKey = config.integrations?.amapApiKey
+  return hasItemSecret || Boolean(amapKey && !amapKey.startsWith(SAFE_STORAGE_PREFIX))
 }
 
 function readPlatformConfig(): AgentPlatformConfig {
@@ -1632,6 +2099,7 @@ async function requestChatCompletion(provider: ModelProviderConfig, userText: st
   const data = await response.json()
   return {
     content: data.choices?.[0]?.message?.content ?? '模型没有返回内容。',
+    usage: data.usage as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined,
   }
 }
 
@@ -1685,6 +2153,7 @@ async function requestChatCompletionStream(
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
+  let usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined
 
   while (true) {
     const { done, value } = await reader.read()
@@ -1697,6 +2166,7 @@ async function requestChatCompletionStream(
       if (!dataText || dataText === '[DONE]') continue
       try {
         const payload = JSON.parse(dataText)
+        if (payload.usage) usage = payload.usage
         const delta = payload.choices?.[0]?.delta?.content
         if (typeof delta === 'string' && delta.length > 0) {
           content += delta
@@ -1714,7 +2184,24 @@ async function requestChatCompletionStream(
     if (done) break
   }
 
-  return { content: content || '模型没有返回内容。' }
+  return { content: content || '模型没有返回内容。', usage }
+}
+
+function createUsageMetadata(
+  input: string,
+  output: string,
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number },
+) {
+  const estimatedInputTokens = Math.ceil(input.length / 2)
+  const estimatedOutputTokens = Math.ceil(output.length / 2)
+  return {
+    inputLength: input.length,
+    outputLength: output.length,
+    inputTokens: usage?.prompt_tokens ?? estimatedInputTokens,
+    outputTokens: usage?.completion_tokens ?? estimatedOutputTokens,
+    totalTokens: usage?.total_tokens ?? estimatedInputTokens + estimatedOutputTokens,
+    tokenCountEstimated: !usage,
+  }
 }
 
 async function createAiReply(userText: string) {
@@ -1722,61 +2209,116 @@ async function createAiReply(userText: string) {
   return requestChatCompletion(provider, userText)
 }
 
-function extractToolVariables(input: string) {
-  const cityMatch =
-    input.match(/(?:今天|明天|后天)?([^，。,.?\s]{2,12})(?:的)?天气/) ??
-    input.match(/天气.*?(?:在|查|看)?([^，。,.?\s]{2,12})/)
-
-  return {
-    input,
-    city: cityMatch?.[1]?.replace(/我想|帮我|查询|看看|今天|明天|后天/g, '') || input,
-  }
-}
-
-function applyToolTemplate(template: string, input: string) {
-  const variables = extractToolVariables(input)
-
-  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_match, key: string) => {
-    const value = variables[key as keyof typeof variables] ?? input
-    return encodeURIComponent(value)
-  })
-}
-
 async function invokeCustomTool(toolId: string, input: string) {
   const config = readPlatformConfig()
   const tool = config.customTools.find((item) => item.id === toolId)
+  if (!tool) throw new Error(`Custom tool not found: ${toolId}`)
+  const circuit = toolCircuitStates.get(toolId)
+  if (circuit && circuit.openUntil > Date.now()) throw new Error(`Tool 熔断中，请在 ${Math.ceil((circuit.openUntil - Date.now()) / 1000)} 秒后重试`)
 
-  if (!tool) {
-    throw new Error(`Custom tool not found: ${toolId}`)
+  try {
+    const prepared = prepareToolRequest(tool, input)
+    const headers: Record<string, string> = { 'Content-Type': 'application/json', ...prepared.headers }
+    if (tool.apiKey && (tool.apiKeyPlacement ?? 'bearer') === 'bearer') headers.Authorization = `Bearer ${tool.apiKey}`
+    if (tool.apiKey && tool.apiKeyPlacement === 'header') headers[tool.apiKeyName || 'X-API-Key'] = tool.apiKey
+    const endpoint = validateHttpEndpoint(prepared.endpoint, 'Tool Endpoint')
+    const retries = Math.max(0, Math.min(Number(tool.retries) || 0, 3))
+    let response: Response | null = null
+    let lastError: unknown
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        response = await fetch(endpoint, {
+          signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(tool.timeoutMs) || 20_000, 60_000))),
+          method: tool.method,
+          headers,
+          body: tool.method === 'POST' ? JSON.stringify(prepared.body) : undefined,
+        })
+        if (response.ok || response.status < 500 || attempt === retries) break
+      } catch (error) {
+        lastError = error
+        if (attempt === retries) throw error
+      }
+    }
+    if (!response) throw lastError instanceof Error ? lastError : new Error('Tool request failed')
+    const text = await readResponseTextLimited(response)
+    if (!response.ok) throw new Error(`Custom tool request failed: ${response.status} ${text.slice(0, 200)}`)
+    if (hasToolBusinessError(text)) throw new Error(`Tool 返回业务错误：${text.slice(0, 180)}`)
+    const content = extractToolResponse(text, tool.responsePath).slice(0, 8000)
+    toolCircuitStates.delete(toolId)
+    return { name: tool.name, content }
+  } catch (error) {
+    const failures = (toolCircuitStates.get(toolId)?.failures ?? 0) + 1
+    toolCircuitStates.set(toolId, { failures, openUntil: failures >= 3 ? Date.now() + 30_000 : 0 })
+    throw error
+  }
+}
+
+async function requestAmapJson(endpoint: string) {
+  const response = await fetch(validateHttpEndpoint(endpoint, '高德 Web 服务'), { signal: AbortSignal.timeout(20_000) })
+  const payload = await response.json() as Record<string, unknown>
+  if (!response.ok || String(payload.status) !== '1') {
+    throw new Error(`高德 API 调用失败：${String(payload.info ?? response.status)}（${String(payload.infocode ?? '无错误码')}）`)
+  }
+  return payload
+}
+
+async function planTripWithAmap(value: unknown) {
+  const draft = value as { origin?: unknown; destination?: unknown; dateText?: unknown }
+  const origin = String(draft.origin ?? '').trim().slice(0, 120)
+  const destination = String(draft.destination ?? '').trim().slice(0, 120)
+  const dateText = formatFloatingDisplayText(String(draft.dateText ?? '').trim().slice(0, 40))
+  const key = readPlatformConfig().integrations.amapApiKey?.trim()
+  if (!origin || !destination) throw new Error('出发地和目的地不能为空')
+  if (!key) throw new Error('未配置高德 Web 服务 Key')
+
+  const geocode = async (address: string) => {
+    const payload = await requestAmapJson(`https://restapi.amap.com/v3/geocode/geo?address=${encodeURIComponent(address)}&key=${encodeURIComponent(key)}`)
+    const item = (payload.geocodes as Array<Record<string, unknown>> | undefined)?.[0]
+    if (!item?.location) throw new Error(`高德没有找到地点：${address}`)
+    return { location: String(item.location), adcode: String(item.adcode ?? ''), formattedAddress: String(item.formatted_address ?? address) }
   }
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+  const [originLocation, destinationLocation] = await Promise.all([geocode(origin), geocode(destination)])
+  const [weatherPayload, routePayload] = await Promise.all([
+    requestAmapJson(`https://restapi.amap.com/v3/weather/weatherInfo?city=${encodeURIComponent(destinationLocation.adcode)}&extensions=all&key=${encodeURIComponent(key)}`),
+    requestAmapJson(`https://restapi.amap.com/v5/direction/driving?origin=${encodeURIComponent(originLocation.location)}&destination=${encodeURIComponent(destinationLocation.location)}&key=${encodeURIComponent(key)}&show_fields=cost`),
+  ])
+  const forecast = (weatherPayload.forecasts as Array<Record<string, unknown>> | undefined)?.[0]
+  const casts = (forecast?.casts as Array<Record<string, unknown>> | undefined) ?? []
+  const selectedWeather = casts.find((cast) => String(cast.date) === dateText) ?? casts[0]
+  const route = routePayload.route as Record<string, unknown> | undefined
+  const pathItem = (route?.paths as Array<Record<string, unknown>> | undefined)?.[0]
+  const cost = pathItem?.cost as Record<string, unknown> | undefined
+  const result = {
+    origin: originLocation.formattedAddress,
+    destination: destinationLocation.formattedAddress,
+    dateText,
+    weather: selectedWeather ? {
+      date: String(selectedWeather.date ?? dateText), dayWeather: String(selectedWeather.dayweather ?? ''),
+      nightWeather: String(selectedWeather.nightweather ?? ''), dayTemp: String(selectedWeather.daytemp ?? ''),
+      nightTemp: String(selectedWeather.nighttemp ?? ''), dayWind: String(selectedWeather.daywind ?? ''),
+    } : null,
+    route: pathItem ? {
+      distanceMeters: Number(pathItem.distance ?? route?.distance ?? 0),
+      durationSeconds: Number(cost?.duration ?? pathItem.duration ?? 0),
+      tolls: Number(cost?.tolls ?? 0),
+    } : null,
   }
+  writeAuditLog({ category: 'tool', action: 'amap.trip-plan', summary: `高德行程查询成功：${origin} → ${destination}`, metadata: { hasWeather: Boolean(result.weather), hasRoute: Boolean(result.route) } })
+  return result
+}
 
-  if (tool.apiKey) {
-    headers.Authorization = `Bearer ${tool.apiKey}`
-  }
-
-  const endpoint = validateHttpEndpoint(applyToolTemplate(tool.endpoint, input), 'Tool Endpoint')
-
-  const response = await fetch(endpoint, {
-    signal: AbortSignal.timeout(20_000),
-    method: tool.method,
-    headers,
-    body: tool.method === 'POST' ? JSON.stringify(extractToolVariables(input)) : undefined,
+async function exportTripCard(value: unknown) {
+  const card = value as { title?: unknown; content?: unknown }
+  const title = String(card.title ?? '出差规划').slice(0, 120)
+  const content = String(card.content ?? '').slice(0, 30_000)
+  const result = await dialog.showSaveDialog({
+    title: '导出行程卡', defaultPath: `${title.replace(/[\\/:*?"<>|]/g, '-')}.md`,
+    filters: [{ name: 'Markdown', extensions: ['md'] }, { name: '文本', extensions: ['txt'] }],
   })
-
-  const text = await readResponseTextLimited(response)
-
-  if (!response.ok) {
-    throw new Error(`Custom tool request failed: ${response.status} ${text.slice(0, 200)}`)
-  }
-
-  return {
-    name: tool.name,
-    content: text.slice(0, 8000),
-  }
+  if (result.canceled || !result.filePath) return { exported: false }
+  fs.writeFileSync(result.filePath, `# ${title}\n\n${content}\n`, 'utf8')
+  return { exported: true, path: result.filePath }
 }
 
 function createMainWindow() {
@@ -1821,7 +2363,7 @@ ipcMain.handle('ai:chat', async (_event, userText: string) => {
   const startedAt = Date.now()
   try {
     const reply = await createAiReply(userText)
-    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: { inputLength: userText.length, outputLength: reply.content.length } })
+    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: createUsageMetadata(userText, reply.content, reply.usage) })
     return reply
   } catch (error) {
     writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话失败', detail: error, status: 'failure', durationMs: Date.now() - startedAt })
@@ -1832,13 +2374,24 @@ ipcMain.handle('ai:chat', async (_event, userText: string) => {
 ipcMain.handle('ai:chat-stream', async (event, requestId: string, userText: string) => {
   const provider = getActiveProvider()
   const startedAt = Date.now()
+  let firstTokenAt: number | undefined
   try {
     const reply = await requestChatCompletionStream(provider, userText, (delta) => {
+      firstTokenAt ??= Date.now()
       if (!event.sender.isDestroyed()) {
         event.sender.send('ai:chat-stream-delta', requestId, delta)
       }
     })
-    writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复完成：${provider.name}`, durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model, inputLength: userText.length, outputLength: reply.content.length } })
+    writeAuditLog({
+      category: 'agent', action: 'chat.stream', summary: `流式回复完成：${provider.name}`,
+      durationMs: Date.now() - startedAt,
+      metadata: {
+        providerId: provider.id,
+        model: provider.model,
+        firstTokenMs: firstTokenAt ? firstTokenAt - startedAt : undefined,
+        ...createUsageMetadata(userText, reply.content, reply.usage),
+      },
+    })
     return reply
   } catch (error) {
     writeAuditLog({ category: 'agent', action: 'chat.stream', summary: `流式回复失败：${provider.name}`, detail: error, status: 'failure', durationMs: Date.now() - startedAt, metadata: { providerId: provider.id, model: provider.model } })
@@ -1897,23 +2450,27 @@ ipcMain.handle('data:open-folder', async () => {
   return dataPath
 })
 
-ipcMain.handle('knowledge:sync', (_event, documents: unknown) => {
-  return syncKnowledgeDocuments(documents)
+ipcMain.handle('knowledge:sync', async (_event, documents: unknown) => {
+  return await syncKnowledgeDocuments(documents)
 })
 
 ipcMain.handle('knowledge:list', () => {
   return listKnowledgeDocuments()
 })
 
-ipcMain.handle('knowledge:upsert', (_event, document: unknown) => {
-  return upsertKnowledgeDocument(document)
+ipcMain.handle('knowledge:upsert', async (_event, document: unknown) => {
+  return await upsertKnowledgeDocument(document)
 })
 
-ipcMain.handle('knowledge:search', (_event, query: string, limit?: number) => {
+ipcMain.handle('knowledge:search', async (_event, query: string, limit?: number) => {
   const safeQuery = typeof query === 'string' ? query.slice(0, 1000) : ''
-  const results = searchKnowledge(safeQuery, limit)
-  writeAuditLog({ category: 'knowledge', action: 'knowledge.search', summary: `资料库检索命中 ${results.length} 个片段`, status: results.length > 0 ? 'success' : 'failure', level: results.length > 0 ? 'info' : 'warn', metadata: { queryLength: safeQuery.length, results: results.length, sources: [...new Set(results.map((item) => item.documentName))].join(', ') } })
+  const results = await searchKnowledge(safeQuery, limit)
+  writeAuditLog({ category: 'knowledge', action: 'knowledge.search', summary: `资料库检索命中 ${results.length} 个片段`, status: results.length > 0 ? 'success' : 'failure', level: results.length > 0 ? 'info' : 'warn', metadata: { queryLength: safeQuery.length, results: results.length, mode: results.some((item) => item.retrievalMode === 'hybrid') ? 'hybrid' : 'keyword', sources: [...new Set(results.map((item) => item.documentName))].join(', ') } })
   return results
+})
+
+ipcMain.handle('knowledge:rebuild-embeddings', async () => {
+  return await rebuildKnowledgeEmbeddings()
 })
 
 ipcMain.handle('knowledge:delete', (_event, documentId: string) => {
@@ -2110,6 +2667,55 @@ ipcMain.handle('workflow:open-floating-report', (_event, reportId: string) => {
   return true
 })
 
+ipcMain.handle('workflow:open-floating-plan', (_event, planId: string) => {
+  const plan = readWorkspaceData().plans.find((item) => item.id === planId)
+  if (!plan) return false
+  const status = plan.status === 'done' ? '已完成' : '进行中'
+  const dueText = plan.dueDate ? ` · 截止 ${formatFloatingDisplayText(plan.dueDate)}` : ''
+  const content = [
+    `- 下一步：${plan.nextAction || plan.description || '继续推进当前计划'}`,
+    `- 截止日期：${plan.dueDate ? formatFloatingDisplayText(plan.dueDate) : '未设置'}`,
+    `- 提醒：${plan.reminderTime || '未设置'}`,
+  ].join('\n')
+  openFloatingReport({
+    id: plan.id,
+    title: plan.title,
+    summary: `${status} · 完成度 ${plan.progress}%${dueText}`,
+    content,
+    source: '计划跟踪',
+    createdAt: plan.updatedAt,
+  }, 'plan', plan.progress)
+  return true
+})
+
+function isFloatingReportSender(senderId: number) {
+  return Boolean(floatingReportWindow && !floatingReportWindow.isDestroyed() && floatingReportWindow.webContents.id === senderId)
+}
+
+ipcMain.on('floating-report:activity', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportLastHoverAt = Date.now()
+  clearFloatingReportHideTimer()
+  if (floatingReportHidden) expandFloatingReport()
+})
+
+ipcMain.on('floating-report:leave', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportLastHoverAt = Date.now() - 1600
+  scheduleFloatingReportHide(500)
+})
+
+ipcMain.on('floating-report:collapse', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  clearFloatingReportHideTimer()
+  moveFloatingReport(true)
+})
+
+ipcMain.on('floating-report:close', (event) => {
+  if (!isFloatingReportSender(event.sender.id)) return
+  floatingReportWindow?.close()
+})
+
 ipcMain.handle('platform:get-extensions-path', () => {
   return getExtensionsPath()
 })
@@ -2131,6 +2737,9 @@ ipcMain.handle('tool:invoke-custom', async (_event, toolId: string, input: strin
     throw error
   }
 })
+
+ipcMain.handle('trip:plan-amap', (_event, draft: unknown) => planTripWithAmap(draft))
+ipcMain.handle('trip:export-card', (_event, card: unknown) => exportTripCard(card))
 
 ipcMain.handle('file:pick-text', async () => {
   const result = await dialog.showOpenDialog({

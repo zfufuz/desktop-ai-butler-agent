@@ -27,6 +27,17 @@ type ModelProviderConfig = {
   baseUrl?: string
 }
 
+type RagConfig = {
+  embeddingEnabled: boolean
+  embeddingProviderId: string
+  embeddingModel: string
+  embeddingBaseUrl: string
+  rerankerEnabled: boolean
+  rerankerModel: string
+  rerankerBaseUrl: string
+  topK: number
+}
+
 type CustomSkillConfig = {
   id: string
   name: string
@@ -43,6 +54,16 @@ type CustomToolConfig = {
   endpoint: string
   method: 'GET' | 'POST'
   apiKey?: string
+  apiKeyPlacement?: 'none' | 'bearer' | 'query' | 'header'
+  apiKeyName?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  retries?: number
+  version?: string
+  inputSchema?: { properties: Record<string, { type: 'string' | 'number' | 'boolean'; description?: string }>; required?: string[] }
+  queryParams?: Record<string, string>
+  bodyParams?: Record<string, string>
+  responsePath?: string
   enabled?: boolean
   source?: 'manual' | 'extension'
 }
@@ -52,11 +73,24 @@ type AgentPlatformConfig = {
   providers: ModelProviderConfig[]
   customSkills: CustomSkillConfig[]
   customTools: CustomToolConfig[]
+  rag: RagConfig
+  integrations: {
+    amapApiKey?: string
+  }
+  deletedBuiltinToolIds?: string[]
 }
 
 type CustomToolResult = {
   name: string
   content: string
+}
+
+type TripApiResult = {
+  origin: string
+  destination: string
+  dateText: string
+  weather: null | { date: string; dayWeather: string; nightWeather: string; dayTemp: string; nightTemp: string; dayWind: string }
+  route: null | { distanceMeters: number; durationSeconds: number; tolls: number }
 }
 
 type PlanStatus = 'active' | 'done'
@@ -105,7 +139,7 @@ type ButlerWorkspaceData = {
 type AgentRunSnapshot = {
   id: string
   goal: string
-  status: 'running' | 'completed' | 'blocked' | 'failed'
+  status: 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
   turns: number
   startedAt: number
   finishedAt?: number
@@ -153,6 +187,9 @@ type KnowledgeSearchResult = {
   chunkIndex: number
   content: string
   score: number
+  lexicalScore: number
+  semanticScore: number
+  retrievalMode: 'keyword' | 'hybrid'
 }
 
 type KnowledgeDocumentSummary = {
@@ -162,6 +199,7 @@ type KnowledgeDocumentSummary = {
   updatedAt: number
   chunkCount: number
   characterCount: number
+  embeddingCount: number
 }
 
 type MemoryNote = {
@@ -212,6 +250,7 @@ declare global {
         document: KnowledgeDocumentInput,
       ) => Promise<{ id: string; name: string; createdAt: number; chunkCount: number }>
       searchKnowledge: (query: string, limit?: number) => Promise<KnowledgeSearchResult[]>
+      rebuildKnowledgeEmbeddings: () => Promise<{ documents: number; embeddings: number; model: string }>
       deleteKnowledgeDocument: (documentId: string) => Promise<{ deleted: boolean; id: string }>
       getMemoryNotes: () => Promise<MemoryNote[]>
       syncMemoryNotes: (notes: string[]) => Promise<MemoryNote[]>
@@ -230,9 +269,12 @@ declare global {
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>
       notify: (title: string, body: string) => Promise<boolean>
       openFloatingReport: (reportId: string) => Promise<boolean>
+      openFloatingPlan: (planId: string) => Promise<boolean>
       getExtensionsPath: () => Promise<string>
       openExtensionsFolder: () => Promise<string>
       invokeCustomTool: (toolId: string, input: string) => Promise<CustomToolResult>
+      planTripWithAmap: (draft: { origin: string; destination: string; dateText: string }) => Promise<TripApiResult>
+      exportTripCard: (card: { title: string; content: string }) => Promise<{ exported: boolean; path?: string }>
     }
   }
 }

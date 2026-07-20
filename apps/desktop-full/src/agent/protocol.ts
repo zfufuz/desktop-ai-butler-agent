@@ -38,6 +38,7 @@ export type AgentObservation = {
   startedAt: number
   finishedAt: number
   attempts?: number
+  inputFingerprint?: string
 }
 
 export type AgentDecision = {
@@ -46,7 +47,7 @@ export type AgentDecision = {
   final?: string
 }
 
-export type AgentRunStatus = 'running' | 'completed' | 'blocked' | 'failed'
+export type AgentRunStatus = 'queued' | 'running' | 'paused' | 'cancelled' | 'completed' | 'blocked' | 'failed'
 
 export type AgentRun = {
   id: string
@@ -58,6 +59,7 @@ export type AgentRun = {
   observations: AgentObservation[]
   final?: string
   error?: string
+  pauseReason?: string
 }
 
 export type AgentRuntimeEvent =
@@ -66,3 +68,5 @@ export type AgentRuntimeEvent =
   | { type: 'tool-start'; turn: number; call: AgentToolCall }
   | { type: 'tool-finish'; turn: number; observation: AgentObservation }
   | { type: 'complete'; turn: number; detail: string }
+  | { type: 'paused'; turn: number; detail: string }
+  | { type: 'cancelled'; turn: number; detail: string }

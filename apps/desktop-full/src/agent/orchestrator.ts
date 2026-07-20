@@ -22,6 +22,10 @@ type AgentOrchestratorOptions = {
   onEvent?: (event: AgentRuntimeEvent) => void
   onCheckpoint?: (run: AgentRun) => Promise<unknown> | unknown
   maxTurns?: number
+  maxToolCalls?: number
+  maxDurationMs?: number
+  signal?: AbortSignal
+  shouldPause?: () => boolean | Promise<boolean>
 }
 
 function createRunId() {
@@ -74,9 +78,16 @@ export class AgentOrchestrator {
     }
   }
 
-  async run(goal: string): Promise<AgentRun> {
-    const startedAt = Date.now()
-    const run: AgentRun = {
+  async run(goal: string, checkpoint?: AgentRun): Promise<AgentRun> {
+    const startedAt = checkpoint?.startedAt ?? Date.now()
+    const run: AgentRun = checkpoint ? {
+      ...checkpoint,
+      goal,
+      status: 'running',
+      finishedAt: undefined,
+      pauseReason: undefined,
+      observations: [...checkpoint.observations],
+    } : {
       id: createRunId(),
       goal,
       status: 'running',
@@ -84,12 +95,34 @@ export class AgentOrchestrator {
       startedAt,
       observations: [],
     }
-    const executedCalls = new Set<string>()
+    const executedCalls = new Set(run.observations.map((item) => item.inputFingerprint).filter(Boolean) as string[])
     const maxTurns = Math.max(1, Math.min(this.options.maxTurns ?? 4, 8))
+    const maxToolCalls = Math.max(1, Math.min(this.options.maxToolCalls ?? 12, 50))
+    const maxDurationMs = Math.max(1000, Math.min(this.options.maxDurationMs ?? 120_000, 600_000))
+    let toolCallCount = run.observations.length
     await this.checkpoint(run)
 
     try {
-      for (let turn = 1; turn <= maxTurns; turn += 1) {
+      for (let turn = Math.max(1, run.turns + (checkpoint ? 1 : 0)); turn <= maxTurns; turn += 1) {
+        if (this.options.signal?.aborted) {
+          run.status = 'cancelled'
+          run.finishedAt = Date.now()
+          await this.checkpoint(run)
+          this.options.onEvent?.({ type: 'cancelled', turn: run.turns, detail: '任务已取消' })
+          return run
+        }
+        if (Date.now() - startedAt >= maxDurationMs) {
+          run.status = 'blocked'
+          run.error = '任务超过最长运行时间'
+          break
+        }
+        if (await this.options.shouldPause?.()) {
+          run.status = 'paused'
+          run.pauseReason = '用户暂停任务'
+          await this.checkpoint(run)
+          this.options.onEvent?.({ type: 'paused', turn: run.turns, detail: run.pauseReason })
+          return run
+        }
         run.turns = turn
         await this.checkpoint(run)
         const context: DecisionContext = {
@@ -124,6 +157,16 @@ export class AgentOrchestrator {
         if (calls.length === 0) break
 
         for (const call of calls) {
+          if (toolCallCount >= maxToolCalls) {
+            run.status = 'blocked'
+            run.error = `任务超过最大 Tool 调用次数（${maxToolCalls}）`
+            break
+          }
+          if (this.options.signal?.aborted) {
+            run.status = 'cancelled'
+            break
+          }
+          toolCallCount += 1
           const toolStartedAt = Date.now()
           this.options.onEvent?.({ type: 'tool-start', turn, call })
           let result: Omit<AgentObservation, 'callId' | 'toolName' | 'startedAt' | 'finishedAt'>
@@ -152,20 +195,28 @@ export class AgentOrchestrator {
             startedAt: toolStartedAt,
             finishedAt: Date.now(),
             attempts,
+            inputFingerprint: callFingerprint(call),
           }
           run.observations.push(observation)
           await this.checkpoint(run)
           this.options.onEvent?.({ type: 'tool-finish', turn, observation })
         }
+        if (run.status === 'blocked' || run.status === 'cancelled') break
       }
 
+      if (run.status === 'cancelled') {
+        run.finishedAt = Date.now()
+        await this.checkpoint(run)
+        this.options.onEvent?.({ type: 'cancelled', turn: run.turns, detail: '任务已取消' })
+        return run
+      }
       run.final = await this.options.synthesize({
         goal,
         turn: run.turns,
         tools: this.options.tools,
         observations: run.observations,
       })
-      run.status = run.observations.length > 0 ? 'completed' : 'blocked'
+      if (run.status !== 'blocked') run.status = run.observations.length > 0 ? 'completed' : 'blocked'
       run.finishedAt = Date.now()
       await this.checkpoint(run)
       this.options.onEvent?.({

@@ -21,6 +21,10 @@ apps/
 - SQLite 持久化、FTS5 分段检索、来源片段预览和 Agent 运行历史。
 - SQLite 审计日志中心，按级别、类别、状态和关键词筛选，支持脱敏导出。
 - Agent 运行检查点、中断恢复、严格 Tool Schema 校验和低风险只读工具重试。
+- Agent 任务可暂停、继续和取消，checkpoint 与观察结果写入 SQLite。
+- 文件和 RAG 片段按不可信数据隔离，报告与计划写入前需要用户确认。
+- 70 条 Eval 题库，支持真实运行 15 条 RAG 检索并统计 Recall@5、MRR、NDCG@5。
+- 高德 Web 服务 Key 可在设置中加密配置，用于天气与驾车路线工作流。
 - 计划优先级、截止日期、重复周期、完成度、下一步、逾期提醒和 AI 复盘。
 - 长期记忆分类、置顶、编辑、有效期，以及不含密钥的本地数据备份。
 - Provider 与 Tool API Key 使用 Electron `safeStorage` 加密保存。

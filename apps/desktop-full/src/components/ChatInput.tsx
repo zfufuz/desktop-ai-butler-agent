@@ -58,9 +58,7 @@ function ChatInput({
           placeholder="描述你想让管家怎么处理这些文件，或直接输入问题..."
           onChange={(event) => onInputChange(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              onSend()
-            }
+            if (event.key === 'Enter') onSend()
           }}
           disabled={isThinking}
         />

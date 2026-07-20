@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getKnowledgeDocuments: () => ipcRenderer.invoke('knowledge:list'),
   upsertKnowledgeDocument: (document: unknown) => ipcRenderer.invoke('knowledge:upsert', document),
   searchKnowledge: (query: string, limit = 6) => ipcRenderer.invoke('knowledge:search', query, limit),
+  rebuildKnowledgeEmbeddings: () => ipcRenderer.invoke('knowledge:rebuild-embeddings'),
   deleteKnowledgeDocument: (documentId: string) => ipcRenderer.invoke('knowledge:delete', documentId),
   getMemoryNotes: () => ipcRenderer.invoke('memory:list'),
   syncMemoryNotes: (notes: unknown) => ipcRenderer.invoke('memory:sync', notes),
@@ -54,8 +55,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteActivity: (activityId: string) => ipcRenderer.invoke('workflow:delete-activity', activityId),
   notify: (title: string, body: string) => ipcRenderer.invoke('workflow:notify', title, body),
   openFloatingReport: (reportId: string) => ipcRenderer.invoke('workflow:open-floating-report', reportId),
+  openFloatingPlan: (planId: string) => ipcRenderer.invoke('workflow:open-floating-plan', planId),
   getExtensionsPath: () => ipcRenderer.invoke('platform:get-extensions-path'),
   openExtensionsFolder: () => ipcRenderer.invoke('platform:open-extensions-folder'),
   invokeCustomTool: (toolId: string, input: string) =>
     ipcRenderer.invoke('tool:invoke-custom', toolId, input),
+  planTripWithAmap: (draft: unknown) => ipcRenderer.invoke('trip:plan-amap', draft),
+  exportTripCard: (card: unknown) => ipcRenderer.invoke('trip:export-card', card),
 })

@@ -127,4 +127,116 @@ describe('AgentOrchestrator', () => {
     expect(checkpoints[0]).toBe('running')
     expect(checkpoints.at(-1)).toBe('completed')
   })
+
+  it('pauses and resumes from a checkpoint without repeating a tool call', async () => {
+    let pause = false
+    const execute = vi.fn().mockImplementation(async () => {
+      pause = true
+      return { ok: true, summary: '已检索', content: '结果' }
+    })
+    const decide = vi.fn().mockResolvedValue({
+      calls: [{ id: 'same', name: 'searchKnowledge', input: { query: '恢复' } }],
+    })
+    const orchestrator = new AgentOrchestrator({
+      tools: [searchTool], decide, execute, synthesize: vi.fn().mockResolvedValue('完成'),
+      shouldPause: () => pause,
+    })
+    const paused = await orchestrator.run('恢复任务')
+    expect(paused.status).toBe('paused')
+    pause = false
+    const resumed = await orchestrator.run('恢复任务', paused)
+    expect(resumed.status).toBe('completed')
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels before making a decision', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const decide = vi.fn()
+    const run = await new AgentOrchestrator({
+      tools: [searchTool], decide, execute: vi.fn(), synthesize: vi.fn(), signal: controller.signal,
+    }).run('取消任务')
+    expect(run.status).toBe('cancelled')
+    expect(decide).not.toHaveBeenCalled()
+  })
+
+  it('stops when the tool-call budget is exhausted', async () => {
+    let sequence = 0
+    const run = await new AgentOrchestrator({
+      tools: [searchTool], maxToolCalls: 1,
+      decide: vi.fn().mockImplementation(async () => ({
+        calls: [{ id: `call-${sequence}`, name: 'searchKnowledge', input: { query: `query-${sequence++}` } }],
+      })),
+      execute: vi.fn().mockResolvedValue({ ok: true, summary: 'ok', content: 'ok' }),
+      synthesize: vi.fn().mockResolvedValue('预算已耗尽'),
+    }).run('预算测试')
+    expect(run.status).toBe('blocked')
+    expect(run.error).toContain('最大 Tool 调用次数')
+  })
+
+  it('rejects an unknown tool without executing it', async () => {
+    const execute = vi.fn()
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide: vi.fn().mockResolvedValue({ calls: [{ id: 'unknown', name: 'deleteEverything', input: {} }] }),
+      execute,
+      synthesize: vi.fn().mockResolvedValue('未执行未知工具。'),
+    }).run('调用未知工具')
+    expect(execute).not.toHaveBeenCalled()
+    expect(run.status).toBe('blocked')
+  })
+
+  it('rejects additional parameters outside the schema', async () => {
+    const execute = vi.fn()
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide: vi.fn().mockResolvedValue({
+        calls: [{ id: 'extra', name: 'searchKnowledge', input: { query: '预算', secret: 'no' } }],
+      }),
+      execute,
+      synthesize: vi.fn().mockResolvedValue('参数不合法。'),
+    }).run('检索预算')
+    expect(execute).not.toHaveBeenCalled()
+    expect(run.status).toBe('blocked')
+  })
+
+  it('does not retry a high-risk tool after an exception', async () => {
+    const highRiskTool = { ...searchTool, name: 'deleteFile', riskLevel: 'high' as const }
+    const execute = vi.fn().mockRejectedValue(new Error('denied'))
+    const run = await new AgentOrchestrator({
+      tools: [highRiskTool],
+      decide: vi.fn().mockResolvedValue({ calls: [{ id: 'delete', name: 'deleteFile', input: { query: 'a.txt' } }] }),
+      execute,
+      synthesize: vi.fn().mockResolvedValue('删除失败。'),
+    }).run('删除文件')
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(run.observations[0]).toMatchObject({ ok: false, attempts: 1 })
+  })
+
+  it('records a failed low-risk observation after retry is exhausted', async () => {
+    const execute = vi.fn().mockRejectedValue(new Error('offline'))
+    const run = await new AgentOrchestrator({
+      tools: [searchTool],
+      decide: vi.fn().mockResolvedValue({ calls: [{ id: 'offline', name: 'searchKnowledge', input: { query: '离线' } }] }),
+      execute,
+      synthesize: vi.fn().mockResolvedValue('服务离线。'),
+    }).run('离线检索')
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(run.observations[0]).toMatchObject({ ok: false, attempts: 2 })
+    expect(run.observations[0].content).toContain('offline')
+  })
+
+  it('continues turn numbering when resuming a checkpoint', async () => {
+    const checkpoint = {
+      id: 'resume-run', goal: '继续分析', status: 'paused' as const, turns: 2,
+      startedAt: Date.now() - 1000, observations: [], pauseReason: '等待用户',
+    }
+    const decide = vi.fn().mockResolvedValue({ calls: [], final: 'done' })
+    const run = await new AgentOrchestrator({
+      tools: [searchTool], decide, execute: vi.fn(), synthesize: vi.fn().mockResolvedValue('完成'),
+    }).run('继续分析', checkpoint)
+    expect(run.status).toBe('completed')
+    expect(run.turns).toBe(3)
+    expect(decide).toHaveBeenCalledWith(expect.objectContaining({ turn: 3 }))
+  })
 })
