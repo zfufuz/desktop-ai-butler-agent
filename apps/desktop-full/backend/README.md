@@ -7,9 +7,12 @@ Python backend for Desktop AI Butler.
 - FastAPI HTTP and SSE boundary for Electron.
 - Pydantic request, response, and Tool Schema validation.
 - LangGraph Agent state and future checkpoint migration.
-- Python model, RAG, evaluation, and fine-tuning integrations.
+- LangChain model gateway with synchronous and streaming responses.
+- Hybrid RAG over the Electron SQLite knowledge base, with optional Embedding and reranker services.
+- LangChain StructuredTool execution for user-configured HTTP tools.
+- Future evaluation automation and fine-tuning integrations.
 
-The existing TypeScript Agent remains available while capabilities are migrated.
+Electron prefers the Python model, RAG, and HTTP Tool runtimes. The existing TypeScript implementations remain available as a stable fallback when the sidecar cannot start.
 
 ## Development
 
@@ -28,4 +31,3 @@ Run tests:
 ```
 
 Electron starts this backend automatically when `backend/.venv` is present.
-

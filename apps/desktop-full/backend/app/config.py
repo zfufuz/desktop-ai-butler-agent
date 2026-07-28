@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +13,7 @@ class Settings:
     port: int
     token: str
     log_level: str
+    database_path: Path | None
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -29,6 +31,9 @@ class Settings:
             port=port,
             token=os.getenv("BUTLER_BACKEND_TOKEN", "").strip(),
             log_level=os.getenv("BUTLER_BACKEND_LOG_LEVEL", "INFO").upper(),
+            database_path=(
+                Path(value) if (value := os.getenv("BUTLER_DATABASE_PATH", "").strip()) else None
+            ),
         )
 
 

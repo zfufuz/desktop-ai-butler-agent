@@ -59,12 +59,15 @@ React Renderer（日常工作流 / 高级设置）
   -> Electron IPC
   -> Electron Main Process
        -> Windows / File System / SQLite / safeStorage
-       -> TypeScript Agent（迁移期降级路径）
+       -> TypeScript Agent（稳定降级路径）
        -> FastAPI Sidecar（随机 loopback 端口 + 临时令牌）
             -> Pydantic API Contract
             -> LangGraph StateGraph
             -> LangChain StructuredTool Registry
-            -> 后续迁入 Model / RAG / Eval / Checkpoint
+            -> Model Gateway（同步调用 + SSE 流式输出）
+            -> Hybrid RAG（BM25 + Embedding + 重排 + 压缩）
+            -> HTTP Tool Runtime（校验、映射、重试与熔断）
+            -> 后续迁入 Eval / SQLite Checkpoint
 ```
 
 ## 安全设计
@@ -177,7 +180,8 @@ Tool 示例：
 
 ## 当前边界
 
-- Python 后端已真实接入 Electron 生命周期并运行 LangGraph 与 LangChain Tool Schema；完整模型调用、RAG、业务 Tool 和 SQLite checkpoint 仍由 TypeScript 实现，后续按模块迁入 Python。
+- Python 后端已真实接入 Electron 生命周期，并优先执行模型调用与 SSE 流式输出、混合 RAG 检索和用户配置的 HTTP Tool。Electron 继续负责窗口、权限确认、文件系统、密钥和 SQLite 写入；Python 不可用时保留 TypeScript 稳定降级路径。
+- SQLite checkpoint 与 Agent Eval 的批量执行器仍主要位于 TypeScript 侧，后续再迁入 Python；这不影响当前桌面工作流与工具调用。
 - 开发环境使用项目内 `backend/.venv`；Windows 安装包内嵌 Python sidecar 可执行文件的构建流程尚未启用，因此本次改动不会生成新的安装包。
 - XLSX 使用 SheetJS、DOCX 使用 Mammoth、文本型 PDF 使用 PDF.js 体系解析；PPTX 使用本地 XML 提取。扫描 PDF 与图片正文尚未接入 OCR。
 - 自定义 HTTP Tool 已支持结构化 Schema 和常见请求映射；OAuth2 与 MCP Server 仍需后续接入。

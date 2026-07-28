@@ -12,7 +12,7 @@ import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-u
 import { readXlsxFile } from './excel-parser.js'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
 import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
-import { BackendService } from './backend-service.js'
+import { BackendService, type BackendEmbeddingConfig, type BackendModelProvider, type BackendRerankerConfig } from './backend-service.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -203,6 +203,7 @@ const backendService = new BackendService({
   appRoot,
   resourcesPath: process.resourcesPath,
   isPackaged: app.isPackaged,
+  databasePath: getDatabasePath,
   onLog: (level, message) => {
     const output = level === 'error' ? console.error : level === 'warn' ? console.warn : console.info
     output(`[agent-backend] ${message}`)
@@ -1141,6 +1142,57 @@ async function searchKnowledge(query: string, requestedLimit = 5): Promise<Knowl
   if (terms.length === 0) return []
   const configuredLimit = readPlatformConfig().rag.topK
   const limit = Math.max(1, Math.min(Number(requestedLimit) || configuredLimit, 10))
+  if (backendService.getStatus().state === 'ready') {
+    const config = readPlatformConfig()
+    const embeddingRuntime = getEmbeddingRuntime()
+    const embedding: BackendEmbeddingConfig | undefined = embeddingRuntime
+      ? {
+          model: embeddingRuntime.model,
+          apiKey: embeddingRuntime.provider.apiKey!,
+          baseUrl: embeddingRuntime.endpoint,
+        }
+      : undefined
+    const rerankerProvider = config.providers.find((item) => item.id === config.rag.embeddingProviderId)
+    const reranker: BackendRerankerConfig | undefined = (
+      config.rag.rerankerEnabled
+      && rerankerProvider?.type !== 'mock'
+      && rerankerProvider?.apiKey
+      && config.rag.rerankerModel.trim()
+      && config.rag.rerankerBaseUrl.trim()
+    )
+      ? {
+          model: config.rag.rerankerModel.trim(),
+          apiKey: rerankerProvider.apiKey,
+          baseUrl: config.rag.rerankerBaseUrl.trim(),
+        }
+      : undefined
+
+    try {
+      const response = await backendService.searchKnowledge(query, limit, embedding, reranker)
+      writeAuditLog({
+        category: 'knowledge',
+        action: 'knowledge.search.python',
+        summary: `Python RAG 检索完成：${response.results.length} 个结果`,
+        level: response.degradedReasons.length > 0 ? 'warn' : 'info',
+        metadata: {
+          resultCount: response.results.length,
+          degradedReasons: response.degradedReasons,
+          embeddingEnabled: Boolean(embedding),
+          rerankerEnabled: Boolean(reranker),
+        },
+      })
+      return response.results
+    } catch (error) {
+      writeAuditLog({
+        category: 'knowledge',
+        action: 'knowledge.search.fallback',
+        summary: 'Python RAG 检索失败，已回退 TypeScript',
+        detail: error,
+        level: 'warn',
+        status: 'failure',
+      })
+    }
+  }
   const candidateLimit = Math.max(20, limit * 6)
   const db = initializeDatabase()
   const ftsQuery = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
@@ -2225,9 +2277,78 @@ function createUsageMetadata(
   }
 }
 
+function canUsePythonModel(provider: ModelProviderConfig): provider is ModelProviderConfig & {
+  type: 'zhipu' | 'openai-compatible'
+  apiKey: string
+} {
+  return provider.type !== 'mock'
+    && Boolean(provider.apiKey)
+    && backendService.getStatus().state === 'ready'
+}
+
+function toBackendModelProvider(
+  provider: ModelProviderConfig & { type: 'zhipu' | 'openai-compatible'; apiKey: string },
+): BackendModelProvider {
+  return {
+    type: provider.type,
+    model: provider.model,
+    apiKey: provider.apiKey,
+    baseUrl: provider.baseUrl,
+  }
+}
+
 async function createAiReply(userText: string) {
   const provider = getActiveProvider()
-  return requestChatCompletion(provider, userText)
+  if (canUsePythonModel(provider)) {
+    try {
+      return await backendService.invokeChat(toBackendModelProvider(provider), userText)
+    } catch (error) {
+      writeAuditLog({
+        category: 'agent',
+        action: 'backend.model.fallback',
+        summary: 'Python 模型调用失败，已回退 TypeScript',
+        detail: error,
+        level: 'warn',
+        status: 'failure',
+        metadata: { providerId: provider.id, model: provider.model },
+      })
+    }
+  }
+  return {
+    ...await requestChatCompletion(provider, userText),
+    runtime: 'typescript' as const,
+  }
+}
+
+async function requestPreferredChatCompletionStream(
+  provider: ModelProviderConfig,
+  userText: string,
+  onDelta: (delta: string) => void,
+) {
+  if (canUsePythonModel(provider)) {
+    let receivedDelta = false
+    try {
+      return await backendService.streamChat(toBackendModelProvider(provider), userText, (delta) => {
+        receivedDelta = true
+        onDelta(delta)
+      })
+    } catch (error) {
+      if (receivedDelta) throw error
+      writeAuditLog({
+        category: 'agent',
+        action: 'backend.model-stream.fallback',
+        summary: 'Python 流式模型调用失败，已回退 TypeScript',
+        detail: error,
+        level: 'warn',
+        status: 'failure',
+        metadata: { providerId: provider.id, model: provider.model },
+      })
+    }
+  }
+  return {
+    ...await requestChatCompletionStream(provider, userText, onDelta),
+    runtime: 'typescript' as const,
+  }
 }
 
 async function invokeCustomTool(toolId: string, input: string) {
@@ -2239,6 +2360,33 @@ async function invokeCustomTool(toolId: string, input: string) {
   if (circuit && circuit.openUntil > Date.now()) throw new Error(`Tool 熔断中，请在 ${Math.ceil((circuit.openUntil - Date.now()) / 1000)} 秒后重试`)
 
   try {
+    if (backendService.getStatus().state === 'ready') {
+      try {
+        const result = await backendService.invokeTool(tool, input)
+        toolCircuitStates.delete(toolId)
+        writeAuditLog({
+          category: 'tool',
+          action: 'tool.invoke.python',
+          summary: `Python Tool 调用完成：${tool.name}`,
+          durationMs: result.durationMs,
+          metadata: { toolId, runtime: result.runtime },
+        })
+        return { name: result.name, content: result.content }
+      } catch (error) {
+        // 后端仍在线时说明是参数或业务错误，不能再次请求有副作用的 Tool。
+        if (backendService.getStatus().state === 'ready') throw error
+        writeAuditLog({
+          category: 'tool',
+          action: 'tool.invoke.fallback',
+          summary: `Python Tool 后端不可用，已回退 TypeScript：${tool.name}`,
+          detail: error,
+          level: 'warn',
+          status: 'failure',
+          metadata: { toolId },
+        })
+      }
+    }
+
     const prepared = prepareToolRequest(tool, input)
     const headers: Record<string, string> = { 'Content-Type': 'application/json', ...prepared.headers }
     if (tool.apiKey && (tool.apiKeyPlacement ?? 'bearer') === 'bearer') headers.Authorization = `Bearer ${tool.apiKey}`
@@ -2386,7 +2534,13 @@ ipcMain.handle('ai:chat', async (_event, userText: string) => {
   const startedAt = Date.now()
   try {
     const reply = await createAiReply(userText)
-    writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话已完成', durationMs: Date.now() - startedAt, metadata: createUsageMetadata(userText, reply.content, reply.usage) })
+    writeAuditLog({
+      category: 'agent',
+      action: 'chat.complete',
+      summary: 'AI 对话已完成',
+      durationMs: Date.now() - startedAt,
+      metadata: { runtime: reply.runtime, ...createUsageMetadata(userText, reply.content, reply.usage) },
+    })
     return reply
   } catch (error) {
     writeAuditLog({ category: 'agent', action: 'chat.complete', summary: 'AI 对话失败', detail: error, status: 'failure', durationMs: Date.now() - startedAt })
@@ -2399,7 +2553,7 @@ ipcMain.handle('ai:chat-stream', async (event, requestId: string, userText: stri
   const startedAt = Date.now()
   let firstTokenAt: number | undefined
   try {
-    const reply = await requestChatCompletionStream(provider, userText, (delta) => {
+    const reply = await requestPreferredChatCompletionStream(provider, userText, (delta) => {
       firstTokenAt ??= Date.now()
       if (!event.sender.isDestroyed()) {
         event.sender.send('ai:chat-stream-delta', requestId, delta)
@@ -2411,6 +2565,7 @@ ipcMain.handle('ai:chat-stream', async (event, requestId: string, userText: stri
       metadata: {
         providerId: provider.id,
         model: provider.model,
+        runtime: reply.runtime,
         firstTokenMs: firstTokenAt ? firstTokenAt - startedAt : undefined,
         ...createUsageMetadata(userText, reply.content, reply.usage),
       },
