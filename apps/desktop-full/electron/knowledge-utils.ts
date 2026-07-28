@@ -1,3 +1,4 @@
+// 知识库文本预处理：负责智能切块和生成适合 FTS5/BM25 的检索词。
 export function chunkKnowledgeContent(content: string, maxLength = 1200, overlap = 160) {
   const normalized = content.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
   if (!normalized) return []

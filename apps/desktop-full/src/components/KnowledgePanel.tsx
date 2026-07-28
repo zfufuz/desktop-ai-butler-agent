@@ -1,3 +1,4 @@
+// 知识库面板：展示已入库文档、检索结果、来源片段和索引状态。
 export type KnowledgeDocumentSummary = {
   id: string
   name: string

@@ -1,3 +1,4 @@
+/* 全局基础样式：统一字体、盒模型和页面根节点尺寸。 */
 :root {
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,

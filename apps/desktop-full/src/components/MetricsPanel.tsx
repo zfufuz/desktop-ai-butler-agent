@@ -1,3 +1,4 @@
+// 指标面板：从真实 Agent Run 和 SQLite 审计日志聚合成功率、延迟与 Token。
 import type { AgentRunSnapshot } from './AgentRunsPanel'
 import type { AuditLogEntry } from './AuditLogPanel'
 

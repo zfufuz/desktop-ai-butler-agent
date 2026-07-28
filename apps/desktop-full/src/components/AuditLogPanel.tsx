@@ -1,3 +1,4 @@
+// 审计日志面板：支持按级别、分类、状态和关键词筛选、导出与清理日志。
 import { Download, RefreshCw, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 

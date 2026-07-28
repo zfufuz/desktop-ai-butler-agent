@@ -1,3 +1,4 @@
+// React 渲染进程入口：挂载应用并启用严格模式和顶层错误边界。
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'

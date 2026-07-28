@@ -1,3 +1,4 @@
+// Agent Eval 数据协议：定义评测题、执行结果和聚合指标的统一结构。
 export type EvalCategory = 'file' | 'tool' | 'rag' | 'permission' | 'plan'
 
 export interface EvalCase {

@@ -1,3 +1,4 @@
+// 验证混合 RAG 的向量计算、候选重排和上下文压缩结果。
 import { describe, expect, it } from 'vitest'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates } from './rag-utils'
 

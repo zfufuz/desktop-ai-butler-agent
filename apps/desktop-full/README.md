@@ -2,7 +2,9 @@
 
 一个连接本地文件、桌面工具和大模型的个人工作流 Agent。
 
-项目使用 Electron + React + TypeScript 构建桌面应用。主界面面向普通用户完成资料整理、文件分析、报告与计划闭环；模型 Provider、Prompt Skill、HTTP API Tool、RAG 和 Agent 观测能力统一放在设置与高级设置中，不再维护两套产品界面。
+项目使用 Electron + React + TypeScript 构建桌面应用，并引入 Python FastAPI sidecar 作为 Agent 后端。LangGraph 负责任务状态图，LangChain 提供 Tool Schema 与后续模型、检索器集成边界。主界面面向普通用户完成资料整理、文件分析、报告与计划闭环；模型 Provider、Prompt Skill、HTTP API Tool、RAG 和 Agent 观测能力统一放在设置与高级设置中。
+
+当前采用并行迁移结构：Electron 启动并监控 Python 后端，后端不可用时现有 TypeScript Agent 仍可工作，避免迁移期间破坏桌面功能。
 
 ## 产品结构
 
@@ -27,6 +29,9 @@
 
 ## 核心能力
 
+- FastAPI 本地后端：Pydantic 输入校验、健康检查、同步 API 与 SSE 运行事件
+- LangGraph 状态图：输入标准化、意图路由、节点事件和可测试执行结果
+- LangChain Tool Registry：Pydantic 参数模型、JSON Schema 和结构化调用
 - Electron 主进程托管 API Key 和本地工具能力
 - React 渲染层通过 preload + IPC 调用白名单 API
 - Agent Loop：目标理解、工具规划、工具调用、观察结果、最终回复
@@ -49,15 +54,17 @@
 ## 架构
 
 ```txt
-React Renderer
-  -> 日常工作流 / 高级设置
-  -> Skill Registry
-  -> Agent Service
-  -> Tool Registry
-  -> Preload API
-  -> IPC
+React Renderer（日常工作流 / 高级设置）
+  -> Preload 白名单 API
+  -> Electron IPC
   -> Electron Main Process
-  -> Desktop Tools / Model Provider / File System
+       -> Windows / File System / SQLite / safeStorage
+       -> TypeScript Agent（迁移期降级路径）
+       -> FastAPI Sidecar（随机 loopback 端口 + 临时令牌）
+            -> Pydantic API Contract
+            -> LangGraph StateGraph
+            -> LangChain StructuredTool Registry
+            -> 后续迁入 Model / RAG / Eval / Checkpoint
 ```
 
 ## 安全设计
@@ -73,22 +80,26 @@ React Renderer
 
 ## 运行
 
-```bash
+开发环境需要 Node.js 和 Python 3.11 以上。首次运行先创建隔离的 Python 环境：
+
+```powershell
 npm install
+npm run backend:setup
 npm run dev:electron
 ```
 
-质量检查与 Windows 打包：
+Electron 会自动启动并监控 FastAPI sidecar，不需要再开第三个终端。后端启动失败时，工作台会明确显示 TypeScript 降级模式。
 
-```bash
+质量检查：
+
+```powershell
+npm run backend:test
 npm run lint
 npm test
 npm run build
 npm run build:electron
 npm run package:win
 ```
-
-安装器输出到 `artifacts/`。用户资料、计划、报告、知识库索引和 Agent 运行记录保存在 Electron 用户数据目录，不会写入安装目录。
 
 ## 审计日志与数据管理
 
@@ -166,6 +177,8 @@ Tool 示例：
 
 ## 当前边界
 
+- Python 后端已真实接入 Electron 生命周期并运行 LangGraph 与 LangChain Tool Schema；完整模型调用、RAG、业务 Tool 和 SQLite checkpoint 仍由 TypeScript 实现，后续按模块迁入 Python。
+- 开发环境使用项目内 `backend/.venv`；Windows 安装包内嵌 Python sidecar 可执行文件的构建流程尚未启用，因此本次改动不会生成新的安装包。
 - XLSX 使用 SheetJS、DOCX 使用 Mammoth、文本型 PDF 使用 PDF.js 体系解析；PPTX 使用本地 XML 提取。扫描 PDF 与图片正文尚未接入 OCR。
 - 自定义 HTTP Tool 已支持结构化 Schema 和常见请求映射；OAuth2 与 MCP Server 仍需后续接入。
 - 当前动态立绘是状态驱动的桌面角色动画，不是 Live2D 模型；接入 Live2D 仍需要用户提供合法模型素材与运行时。

@@ -1,3 +1,4 @@
+// React 顶层错误边界：捕获渲染异常并提供可恢复的刷新入口。
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { RefreshCw, TriangleAlert } from 'lucide-react'
 

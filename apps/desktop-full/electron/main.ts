@@ -1,3 +1,4 @@
+// Electron 主进程：管理窗口、本地数据库、文件系统、模型请求、Tool 与系统能力。
 import { app, BrowserWindow, Notification, Tray, dialog, globalShortcut, ipcMain, safeStorage, screen, shell } from 'electron'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -11,6 +12,7 @@ import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-u
 import { readXlsxFile } from './excel-parser.js'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
 import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
+import { BackendService } from './backend-service.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -197,6 +199,16 @@ const toolCircuitStates = new Map<string, { failures: number; openUntil: number 
 let tray: Tray | null = null
 let database: DatabaseSync | null = null
 
+const backendService = new BackendService({
+  appRoot,
+  resourcesPath: process.resourcesPath,
+  isPackaged: app.isPackaged,
+  onLog: (level, message) => {
+    const output = level === 'error' ? console.error : level === 'warn' ? console.warn : console.info
+    output(`[agent-backend] ${message}`)
+  },
+})
+
 function readLocalEnv() {
   const envPath = path.join(appRoot, '.env.local')
 
@@ -274,6 +286,7 @@ function stripXmlTags(xml: string) {
 }
 
 function readZipEntries(filePath: string) {
+  // DOCX/PPTX 本质是 ZIP 容器；这里只在内存中读取文本所需条目。
   const buffer = fs.readFileSync(filePath)
   const entries = new Map<string, Buffer>()
   let offset = 0
@@ -363,6 +376,7 @@ function readImageInfo(filePath: string) {
 }
 
 async function readSupportedFile(filePath: string): Promise<PickedTextFile> {
+  // 文件读取统一留在主进程，渲染层只能取得受长度限制的文本结果。
   const extension = path.extname(filePath).toLowerCase()
   let content = ''
 
@@ -499,6 +513,7 @@ function readLegacyWorkspaceData(): ButlerWorkspaceData {
 }
 
 function initializeDatabase() {
+  // SQLite 同时保存工作流、Agent checkpoint、审计日志和 RAG 索引。
   if (database) return database
 
   const databasePath = getDatabasePath()
@@ -766,6 +781,7 @@ function insertAgentRun(db: DatabaseSync, run: StoredAgentRun) {
 }
 
 function migrateLegacyData(db: DatabaseSync) {
+  // 旧版 JSON 仅迁移一次，Agent 历史使用事务避免出现半迁移数据。
   if (!isMigrationComplete(db, 'legacy-workspace-json-v1')) {
     replaceWorkspaceData(db, readLegacyWorkspaceData())
     markMigrationComplete(db, 'legacy-workspace-json-v1')
@@ -1120,6 +1136,7 @@ function deleteKnowledgeDocument(documentId: string) {
 }
 
 async function searchKnowledge(query: string, requestedLimit = 5): Promise<KnowledgeSearchResult[]> {
+  // 先取 BM25 候选；Embedding 可用时加入向量候选并执行混合重排。
   const terms = createKnowledgeSearchTerms(query)
   if (terms.length === 0) return []
   const configuredLimit = readPlatformConfig().rag.topK
@@ -1222,6 +1239,7 @@ function sanitizeAuditText(value: unknown, maxLength: number) {
 }
 
 function sanitizeAuditMetadata(metadata?: Record<string, unknown>) {
+  // 日志只保留可观测字段，密钥、正文、Token 和密码类字段不会落盘。
   if (!metadata) return {}
   return Object.fromEntries(
     Object.entries(metadata)
@@ -1497,6 +1515,7 @@ function stopFloatingReportCursorMonitor() {
 }
 
 function startFloatingReportCursorMonitor() {
+  // 在主进程读取真实屏幕坐标，使缩到边缘的行动卡仍能可靠展开。
   stopFloatingReportCursorMonitor()
   floatingReportLastHoverAt = Date.now()
   floatingReportCursorMonitor = setInterval(() => {
@@ -1943,6 +1962,7 @@ function decryptPlatformConfig(config: Partial<AgentPlatformConfig>): Partial<Ag
 }
 
 function encryptPlatformConfig(config: AgentPlatformConfig): AgentPlatformConfig {
+  // safeStorage 会把 Provider 和 Tool 密钥绑定到当前 Windows 用户加密。
   return {
     ...config,
     providers: config.providers.map((provider) => ({
@@ -2108,6 +2128,7 @@ async function requestChatCompletionStream(
   userText: string,
   onDelta: (delta: string) => void,
 ) {
+  // 逐行解析 OpenAI 兼容 SSE，并把增量内容转发给渲染层。
   if (provider.type === 'mock' || !provider.apiKey) {
     const reply = await requestChatCompletion(provider, userText)
     onDelta(reply.content)
@@ -2210,6 +2231,7 @@ async function createAiReply(userText: string) {
 }
 
 async function invokeCustomTool(toolId: string, input: string) {
+  // 连续失败达到阈值后短暂熔断，避免故障接口被 Agent 高频调用。
   const config = readPlatformConfig()
   const tool = config.customTools.find((item) => item.id === toolId)
   if (!tool) throw new Error(`Custom tool not found: ${toolId}`)
@@ -2322,6 +2344,7 @@ async function exportTripCard(value: unknown) {
 }
 
 function createMainWindow() {
+  // 窗口禁用 Node 直连，桌面能力必须通过 preload 的 IPC 白名单。
   const preloadPath = path.join(__dirname, 'preload.js')
 
   mainWindow = new BrowserWindow({
@@ -2910,14 +2933,45 @@ ipcMain.handle('window:toggle-always-on-top', () => {
   return nextValue
 })
 
-app.whenReady().then(() => {
+ipcMain.handle('backend:get-status', () => backendService.getStatus())
+
+ipcMain.handle('backend:restart', async () => {
+  const status = await backendService.restart()
+  writeAuditLog({
+    category: 'system',
+    action: 'backend.restart',
+    summary: status.state === 'ready' ? 'FastAPI Agent 后端已重启' : 'FastAPI Agent 后端重启后处于降级状态',
+    detail: status.detail,
+    status: status.state === 'ready' ? 'success' : 'failure',
+    metadata: status,
+  })
+  return status
+})
+
+ipcMain.handle('backend:diagnose', async (_event, message: string) => {
+  if (typeof message !== 'string' || !message.trim()) {
+    throw new Error('诊断消息不能为空')
+  }
+  return backendService.invokeDiagnostic(message.trim())
+})
+
+app.whenReady().then(async () => {
   initializeDatabase()
   migratePlaintextSecrets()
+  const backendStatus = await backendService.start()
   writeAuditLog({
     category: 'system',
     action: 'app.start',
     summary: `应用已启动 v${getApplicationVersion()}`,
-    metadata: { platform: process.platform, arch: process.arch, packaged: app.isPackaged },
+    metadata: { platform: process.platform, arch: process.arch, packaged: app.isPackaged, backend: backendStatus },
+  })
+  writeAuditLog({
+    category: 'system',
+    action: 'backend.start',
+    summary: backendStatus.state === 'ready' ? 'FastAPI + LangGraph 后端已连接' : 'FastAPI 后端未就绪，应用使用 TypeScript 降级路径',
+    detail: backendStatus.detail,
+    status: backendStatus.state === 'ready' ? 'success' : 'failure',
+    metadata: backendStatus,
   })
   createMainWindow()
   globalShortcut.register('CommandOrControl+Shift+Space', () => {
@@ -2962,6 +3016,7 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   writeAuditLog({ category: 'system', action: 'app.stop', summary: '应用正常退出' })
+  backendService.stop()
   globalShortcut.unregisterAll()
   database?.close()
   database = null

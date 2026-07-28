@@ -1,3 +1,4 @@
+// Agent 编排器：执行“决策、调用工具、观察、继续或结束”的受控循环。
 import type {
   AgentDecision,
   AgentObservation,
@@ -33,11 +34,13 @@ function createRunId() {
 }
 
 function callFingerprint(call: AgentToolCall) {
+  // 对参数键排序后生成稳定指纹，用于阻止模型在不同轮次重复调用同一工具。
   const sortedInput = Object.fromEntries(Object.entries(call.input).sort(([left], [right]) => left.localeCompare(right)))
   return `${call.name}:${JSON.stringify(sortedInput)}`
 }
 
 function validateCall(call: AgentToolCall, tools: AgentToolDefinition[]) {
+  // 执行前严格对照注册表校验工具名、字段白名单、数据类型和必填项。
   const tool = tools.find((item) => item.name === call.name)
   if (!tool) return false
 
@@ -68,6 +71,7 @@ export class AgentOrchestrator {
   }
 
   private async checkpoint(run: AgentRun) {
+    // checkpoint 是恢复能力的基础，但持久化失败不能反过来中断用户任务。
     try {
       await this.options.onCheckpoint?.({
         ...run,
@@ -79,6 +83,7 @@ export class AgentOrchestrator {
   }
 
   async run(goal: string, checkpoint?: AgentRun): Promise<AgentRun> {
+    // 恢复任务时沿用历史观察结果，并从下一轮继续，避免重复产生副作用。
     const startedAt = checkpoint?.startedAt ?? Date.now()
     const run: AgentRun = checkpoint ? {
       ...checkpoint,
@@ -104,6 +109,7 @@ export class AgentOrchestrator {
 
     try {
       for (let turn = Math.max(1, run.turns + (checkpoint ? 1 : 0)); turn <= maxTurns; turn += 1) {
+        // 每轮开始前统一检查取消、总耗时和暂停请求，让任务只在安全边界停止。
         if (this.options.signal?.aborted) {
           run.status = 'cancelled'
           run.finishedAt = Date.now()
@@ -139,6 +145,7 @@ export class AgentOrchestrator {
         }
 
         const calls = (decision?.calls ?? []).filter((call) => {
+          // 无效调用和已经执行过的调用都不会进入执行器。
           const fingerprint = callFingerprint(call)
           if (!validateCall(call, this.options.tools) || executedCalls.has(fingerprint)) return false
           executedCalls.add(fingerprint)
@@ -172,6 +179,7 @@ export class AgentOrchestrator {
           let result: Omit<AgentObservation, 'callId' | 'toolName' | 'startedAt' | 'finishedAt'>
           const toolDefinition = this.options.tools.find((tool) => tool.name === call.name)
           const maximumAttempts = toolDefinition?.riskLevel === 'low' ? 2 : 1
+          // 只有低风险只读工具允许自动重试，高风险操作失败后立即停止。
           let attempts = 0
           while (true) {
             attempts += 1

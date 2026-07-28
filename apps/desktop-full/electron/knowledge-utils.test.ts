@@ -1,3 +1,4 @@
+// 验证知识库切块重叠、长度约束和搜索词归一化逻辑。
 import { describe, expect, it } from 'vitest'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils'
 

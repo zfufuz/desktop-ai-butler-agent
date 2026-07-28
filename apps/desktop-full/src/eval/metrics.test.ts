@@ -1,3 +1,4 @@
+// 验证 70 条评测题结构及各类 Agent/RAG 指标的计算正确性。
 import { describe, expect, it } from 'vitest'
 import { agentEvalDataset, evalCategoryCounts } from './dataset'
 import { calculateEvalMetrics } from './metrics'

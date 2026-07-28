@@ -1,9 +1,28 @@
+// React 渲染层的 Electron API 类型契约，必须与 preload 暴露的方法保持一致。
 export {}
 
 type SystemInfo = {
   platform: string
   arch: string
   cpus: number
+}
+
+type BackendServiceStatus = {
+  state: 'starting' | 'ready' | 'degraded' | 'stopped'
+  detail: string
+  port?: number
+  pid?: number
+  version?: string
+  framework?: string
+  agentFramework?: string
+  orchestration?: string
+}
+
+type BackendDiagnosticResult = {
+  run_id: string
+  intent: string
+  response: string
+  steps: string[]
 }
 
 type AssistantReply = {
@@ -219,6 +238,9 @@ declare global {
       getAppName: () => string
       getAppVersion: () => Promise<string>
       getSystemInfo: () => Promise<SystemInfo>
+      getBackendStatus: () => Promise<BackendServiceStatus>
+      restartBackend: () => Promise<BackendServiceStatus>
+      diagnoseBackend: (message: string) => Promise<BackendDiagnosticResult>
       sendChatMessage: (message: string) => Promise<AssistantReply>
       streamChatMessage: (
         message: string,

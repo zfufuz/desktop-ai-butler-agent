@@ -1,3 +1,4 @@
+// Excel 解析器：把工作簿中的工作表转换为便于大模型分析的结构化文本。
 import fs from 'node:fs'
 import * as XLSX from 'xlsx'
 

@@ -1,3 +1,4 @@
+// 使用临时工作簿验证 Excel 多表、中文和数值内容能够可靠解析。
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'

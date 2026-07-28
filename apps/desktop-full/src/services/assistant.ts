@@ -1,3 +1,4 @@
+// 基础模型服务：为浏览器学习版提供 Mock 或智谱的单轮回复接口。
 import { appConfig } from '../config'
 
 export type AssistantReply = {

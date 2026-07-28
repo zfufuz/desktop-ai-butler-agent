@@ -1,3 +1,4 @@
+// 验证 Tool 运行时的 Schema 校验、模板映射和响应解析行为。
 import { describe, expect, it } from 'vitest'
 import { extractToolResponse, getValueAtPath, hasToolBusinessError, prepareToolRequest, validateToolVariables } from './tool-runtime'
 

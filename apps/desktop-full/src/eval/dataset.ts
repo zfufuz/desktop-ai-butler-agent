@@ -1,3 +1,4 @@
+// Agent Eval 题库：覆盖文件分析、Tool 选择、RAG、权限恢复和计划复盘。
 import type { EvalCase, EvalCategory } from './types'
 
 type Seed = Omit<EvalCase, 'id' | 'category'>

@@ -1,3 +1,4 @@
+// Agent Eval 面板：运行本地 RAG 基准并展示 Recall、MRR、NDCG 等真实指标。
 import { useState } from 'react'
 import { agentEvalDataset, evalCategoryCounts, ragEvalFixtures } from '../eval/dataset'
 import { calculateEvalMetrics } from '../eval/metrics'

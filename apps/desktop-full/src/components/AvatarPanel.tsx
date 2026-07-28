@@ -1,3 +1,4 @@
+// 管家状态面板：展示桌面角色、系统信息、本地保护状态和工作状态动画。
 import { Bot, HardDrive, ShieldCheck } from 'lucide-react'
 
 type AvatarPanelProps = {

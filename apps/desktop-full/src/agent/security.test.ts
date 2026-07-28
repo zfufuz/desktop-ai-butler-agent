@@ -1,3 +1,4 @@
+// 验证不可信数据边界不会被文档内容中的伪造闭合标签突破。
 import { describe, expect, it } from 'vitest'
 import { wrapUntrustedCollection, wrapUntrustedContent } from './security'
 

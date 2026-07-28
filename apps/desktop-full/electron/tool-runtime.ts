@@ -1,3 +1,4 @@
+// 自定义 HTTP Tool 运行时：负责参数校验、请求映射、响应提取和业务错误识别。
 export type ToolParameterType = 'string' | 'number' | 'boolean'
 
 export type ToolInputSchema = {
@@ -34,6 +35,7 @@ function extractLegacyVariables(input: string) {
 }
 
 export function parseToolInput(input: string) {
+  // 优先接受结构化 JSON，自然语言则保留旧版天气与路线字段的兼容提取。
   const variables = extractLegacyVariables(input)
   try {
     const parsed = JSON.parse(input) as unknown
@@ -57,6 +59,7 @@ function coerceValue(value: unknown, type: ToolParameterType) {
 }
 
 export function validateToolVariables(schema: ToolInputSchema | undefined, variables: Record<string, unknown>) {
+  // 按 Schema 转换字段类型，并拒绝缺失或类型错误的参数。
   if (!schema) return variables
   const normalized = { ...variables }
   for (const [key, definition] of Object.entries(schema.properties)) {
@@ -89,6 +92,7 @@ function mapValues(mapping: ToolRequestMapping | undefined, variables: Record<st
 }
 
 export function prepareToolRequest(tool: RuntimeTool, input: string) {
+  // 把一次 Tool 输入统一编译为 endpoint、headers、query 和 body。
   const variables = validateToolVariables(tool.inputSchema, {
     ...parseToolInput(input),
     apiKey: tool.apiKey ?? '',
@@ -110,6 +114,7 @@ export function prepareToolRequest(tool: RuntimeTool, input: string) {
 }
 
 export function getValueAtPath(value: unknown, path?: string): unknown {
+  // 支持 data.items.0 形式的路径，只把需要的业务字段交给模型。
   if (!path?.trim()) return value
   return path.split('.').filter(Boolean).reduce<unknown>((current, segment) => {
     if (current === null || current === undefined) return undefined
@@ -133,5 +138,6 @@ export function extractToolResponse(text: string, responsePath?: string) {
 }
 
 export function hasToolBusinessError(text: string) {
+  // HTTP 200 不一定表示业务成功，因此还要识别响应体中的错误状态。
   return /"status"\s*:\s*"?0|"success"\s*:\s*false|ENGINE_RESPONSE_DATA_ERROR|INVALID_USER_KEY|"infocode"\s*:\s*"?3\d+/i.test(text)
 }

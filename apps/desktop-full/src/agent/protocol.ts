@@ -1,3 +1,4 @@
+// Agent 协议类型：统一定义工具、决策、观察、运行状态和运行时事件。
 export type ToolRiskLevel = 'low' | 'medium' | 'high'
 
 export type ToolParameterSchema = {

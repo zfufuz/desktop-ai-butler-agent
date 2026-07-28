@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "desktop-ai-butler-backend"
+version = "0.1.0"
+description = "FastAPI and LangGraph backend for Desktop AI Butler."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<2",
+  "httpx>=0.27,<1",
+  "langchain-core>=0.3,<2",
+  "langgraph>=0.2,<2",
+  "pydantic>=2.9,<3",
+  "sqlalchemy>=2.0,<3",
+  "structlog>=24.4",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.24,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+

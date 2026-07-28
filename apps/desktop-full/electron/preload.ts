@@ -1,3 +1,4 @@
+// Electron 安全桥：仅向 React 渲染层暴露经过白名单约束的 IPC 能力。
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -5,6 +6,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAppName: () => '桌面 AI 管家',
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),
   getSystemInfo: () => ipcRenderer.invoke('system:get-info'),
+  getBackendStatus: () => ipcRenderer.invoke('backend:get-status'),
+  restartBackend: () => ipcRenderer.invoke('backend:restart'),
+  diagnoseBackend: (message: string) => ipcRenderer.invoke('backend:diagnose', message),
   sendChatMessage: (message: string) => ipcRenderer.invoke('ai:chat', message),
   streamChatMessage: (message: string, onDelta: (delta: string) => void) => {
     const requestId = crypto.randomUUID()

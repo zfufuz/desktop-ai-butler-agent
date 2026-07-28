@@ -1,4 +1,5 @@
 ﻿import { useEffect, useRef, useState } from 'react'
+// 主应用工作台：协调聊天、文件、出差、报告、计划、设置和 Agent 可观测状态。
 import {
   ChevronLeft,
   ChevronRight,
@@ -52,6 +53,7 @@ type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
+type BackendServiceStatus = Awaited<ReturnType<Window['electronAPI']['getBackendStatus']>>
 
 function getRegistryInventoryKind(text: string): RegistryInventoryKind | null {
   const asksForList = /有什么|有哪些|列出|查看|当前|已安装|支持|能用/i.test(text)
@@ -318,6 +320,7 @@ function scoreCustomToolForText(tool: CustomToolConfig, text: string) {
 }
 
 function findBestCustomTool(tools: CustomToolConfig[], text: string) {
+  // 根据名称、描述、Endpoint 和问题关键词打分，只自动选择真正命中的工具。
   const rankedTools = tools
     .filter((tool) => tool.enabled !== false)
     .map((tool) => ({ tool, score: scoreCustomToolForText(tool, text) }))
@@ -460,6 +463,7 @@ function createReportSummary(content: string) {
 }
 
 function extractPlanDraftsFromReport(content: string) {
+  // 从报告行动语句中提取最多三条计划，最终仍由用户确认后写入。
   const lines = content
     .split(/\r?\n/)
     .map((line) => line.replace(/^[-*•\d.、\s]+/, '').trim())
@@ -519,6 +523,7 @@ function App() {
   const [isElectronReady, setIsElectronReady] = useState(() => Boolean(window.electronAPI))
   const mode: ProductMode = 'user'
   const [input, setInput] = useState('')
+  const [backendStatus, setBackendStatus] = useState<BackendServiceStatus | null>(null)
   const [pendingAttachments, setPendingAttachments] = useState<LocalTextFile[]>([])
   const [assistantStatus, setAssistantStatus] = useState<AssistantStatus>('idle')
   const [appName, setAppName] = useState(() => window.electronAPI?.getAppName() ?? '桌面 AI 管家')
@@ -736,10 +741,18 @@ function App() {
     window.electronAPI.getSystemInfo().then((systemInfo) => {
       setSystemInfoText(`${systemInfo.platform} / ${systemInfo.arch} / ${systemInfo.cpus} 核`)
     })
+    const refreshBackendStatus = () => {
+      window.electronAPI.getBackendStatus().then(setBackendStatus).catch(() => {
+        setBackendStatus({ state: 'degraded', detail: '无法读取 Agent 后端状态' })
+      })
+    }
+    refreshBackendStatus()
+    const backendStatusTimer = window.setInterval(refreshBackendStatus, 15_000)
     window.electronAPI.getPlatformConfig().then(setPlatformConfig)
     window.electronAPI.getExtensionsPath().then(setExtensionsPath)
     window.electronAPI.getWorkflowData().then(setWorkflowData)
     window.electronAPI.getKnowledgeDocuments().then(setKnowledgeIndex)
+    // 异常退出后，数据库中的 running 任务会恢复为可继续的 paused 状态。
     window.electronAPI.getAgentRuns().then(async (runs) => {
       const restoredRuns = [...runs]
       const resumableRun = restoredRuns.find((run) => run.status === 'paused' || run.status === 'running')
@@ -772,6 +785,8 @@ function App() {
       hasSyncedMemoryRef.current = true
       localStorage.removeItem('ai-butler:memoryNotes')
     })
+
+    return () => window.clearInterval(backendStatusTimer)
   }, [isElectronReady])
 
   useEffect(() => {
@@ -1287,6 +1302,7 @@ ${progressText}`,
   }
 
   async function runTripPlanner(draft: TripDraft) {
+    // 串联高德地理编码、天气、路线和可选酒店 Tool，再生成出差行动卡。
     draft = { ...draft, dateText: normalizeTripDate(draft.dateText) }
     const enabledTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
     const hotelTool = findTripTool(enabledTools, 'hotel')
@@ -1423,6 +1439,7 @@ ${sanitizeTripAdvice(reply.content)}`
   }
 
   async function persistAgentRun(run: AgentRun) {
+    // 每轮 checkpoint 都同步到 SQLite，并更新运行记录和恢复入口。
     const savedRun = await window.electronAPI.saveAgentRun(run)
     setAgentRuns((currentRuns) => [
       savedRun,
@@ -1436,6 +1453,7 @@ ${sanitizeTripAdvice(reply.content)}`
   }
 
   async function executeAgentRequest(text: string, resumeFrom?: AgentRun) {
+    // 将记忆、知识库和启用工具组装成一次可暂停、可恢复的 Agent 运行。
     const enabledCustomTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
     const modeHint = '请优先用通俗表达帮助用户整理资料、分析文件、生成报告和可执行计划。'
     const memoryContext = memoryNotes.length > 0
@@ -1519,6 +1537,7 @@ ${sanitizeTripAdvice(reply.content)}`
   }
 
   async function sendMessage() {
+    // 优先处理附件、确认流程和专用场景，其余请求交给通用 Agent Loop。
     if (isThinking) {
       return
     }
@@ -1670,6 +1689,7 @@ ${sanitizeTripAdvice(reply.content)}`
   }
 
   async function analyzeTextFile(pickedFile: LocalTextFile, userMessageText?: string) {
+    // 文件正文先标记为不可信数据，分析结果再进入保存与建计划确认卡。
     const userMessage: Message = {
       id: createMessageId(),
       role: 'user',
@@ -3441,6 +3461,11 @@ ${result.content}
           <h3>当前状态</h3>
           <ul>
             <li>桌面连接：{isElectronReady ? '已连接' : '未连接'}</li>
+            <li title={[backendStatus?.detail, backendStatus?.framework, backendStatus?.agentFramework, backendStatus?.orchestration].filter(Boolean).join(' / ')}>
+              Agent 后端：{backendStatus?.state === 'ready'
+                ? 'FastAPI + LangChain + LangGraph'
+                : backendStatus?.state === 'starting' ? '启动中' : 'TypeScript 降级模式'}
+            </li>
             <li>当前模型：{activeProvider?.name ?? '加载中'}</li>
             <li>资料库：{knowledgeIndex.length} 份文件</li>
             <li>计划：{activePlans.length} 个进行中 / {finishedPlans.length} 个完成</li>

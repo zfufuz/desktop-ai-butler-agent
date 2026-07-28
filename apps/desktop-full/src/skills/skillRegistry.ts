@@ -1,3 +1,4 @@
+// Skill 注册表：把稳定的业务 Prompt 和 Agent/Tool 执行流程封装为可复用技能。
 import { runAgent, type AgentTimelineStep, type KnowledgeDocument, type ToolCallLog } from '../services/agent'
 import { createAssistantReply, type AssistantReply } from '../services/assistant'
 

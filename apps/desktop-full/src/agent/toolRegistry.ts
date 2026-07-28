@@ -1,3 +1,4 @@
+// 内置 Tool 注册表：声明 Agent 可选择的工具名称、用途、风险和输入 Schema。
 import type { AgentToolDefinition } from './protocol'
 
 export type ToolName = 'getSystemInfo' | 'getAppVersion' | 'pickTextFile' | 'queryKnowledgeBase'

@@ -1,3 +1,4 @@
+// 覆盖 Agent Loop 的正常执行、参数拒绝、重试、预算、暂停与恢复场景。
 import { describe, expect, it, vi } from 'vitest'
 import { AgentOrchestrator } from './orchestrator'
 import type { AgentDecision, AgentToolDefinition } from './protocol'

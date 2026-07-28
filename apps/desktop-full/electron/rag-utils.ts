@@ -1,3 +1,4 @@
+// 混合 RAG 算法工具：处理向量编解码、相似度计算、重排和上下文压缩。
 export type HybridCandidate = {
   documentId: string
   documentName: string
@@ -16,6 +17,7 @@ export type HybridResult = HybridCandidate & {
 }
 
 export function cosineSimilarity(left: number[], right: number[]) {
+  // 余弦相似度比较向量方向，用于衡量查询与片段的语义接近程度。
   if (left.length === 0 || left.length !== right.length) return 0
   let dot = 0
   let leftMagnitude = 0
@@ -50,6 +52,7 @@ export function rerankHybridCandidates(
   queryTerms: string[],
   limit = 5,
 ): HybridResult[] {
+  // 同时利用语义相似度、BM25 排名和关键词覆盖率，降低单一检索信号偏差。
   return candidates
     .map((candidate) => {
       const lexicalScore = candidate.lexicalRank === undefined ? 0 : 1 / (candidate.lexicalRank + 1)
@@ -75,6 +78,7 @@ export function rerankHybridCandidates(
 }
 
 export function compressKnowledgeContext(content: string, queryTerms: string[], maxLength = 700) {
+  // 优先保留命中查询词的句子，再补首句上下文，减少无关 Token。
   if (content.length <= maxLength) return content
   const sentences = content
     .split(/(?<=[。！？!?\n])/)

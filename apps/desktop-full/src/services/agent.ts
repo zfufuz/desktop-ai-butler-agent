@@ -1,3 +1,4 @@
+// 渲染层 Agent 服务：连接模型决策、内置/自定义 Tool、RAG 和编排器。
 import { AgentOrchestrator } from '../agent/orchestrator'
 import type {
   AgentDecision,
@@ -172,6 +173,7 @@ async function getModelDecision(
   logger: ToolLogger,
   context?: string,
 ): Promise<AgentDecision | null> {
+  // 模型必须返回受协议约束的 JSON 决策；失败时由本地规则安全降级。
   try {
     const toolListText = tools
       .map((tool) => JSON.stringify({
@@ -217,6 +219,7 @@ async function executeTool(
   logger: ToolLogger,
   options: AgentOptions,
 ): Promise<Omit<AgentObservation, 'callId' | 'toolName' | 'startedAt' | 'finishedAt'>> {
+  // 所有 Tool 统一经过权限确认、日志记录和结构化观察结果封装。
   const fail = (summary: string, content = summary) => {
     logger(createToolLog(call.name, 'error', summary))
     return { ok: false, summary, content }
@@ -293,6 +296,7 @@ export async function runAgent(
   logger: ToolLogger,
   options: AgentOptions,
 ): Promise<AssistantReply> {
+  // 本层组装决策器与工具执行器，轮次、预算和恢复交给 AgentOrchestrator。
   options.onTimeline(createTimelineStep('接收目标', userText, 'success'))
   const customTools = options.customTools ?? []
   const tools: AgentToolDefinition[] = [

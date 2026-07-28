@@ -1,3 +1,4 @@
+// 消息列表：渲染 Markdown 对话，并在用户停留底部时跟随流式输出滚动。
 import { useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'

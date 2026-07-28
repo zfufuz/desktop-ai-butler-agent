@@ -1,3 +1,4 @@
+// Agent 运行记录面板：展示每次任务的状态、轮次、工具观察和错误原因。
 export type AgentRunSnapshot = {
   id: string
   goal: string

@@ -1,3 +1,4 @@
+// 聊天输入区：管理文本、待发送附件、回车发送和处理中禁用状态。
 import type React from 'react'
 import { LoaderCircle, Paperclip, Send, X } from 'lucide-react'
 

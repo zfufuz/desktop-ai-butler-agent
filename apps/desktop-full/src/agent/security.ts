@@ -1,3 +1,4 @@
+// Prompt 注入防护：把文件和检索结果包装成明确标记的不可信数据。
 const UNTRUSTED_CLOSE_TAG = '</untrusted_data>'
 
 export function wrapUntrustedContent(label: string, content: string) {

@@ -1,3 +1,4 @@
+// Agent Eval 指标计算：统一统计任务、Tool、RAG、引用、幻觉和性能指标。
 import type { EvalCase, EvalMetrics, EvalResult } from './types'
 
 const ratio = (value: number, total: number) => (total === 0 ? 0 : value / total)
