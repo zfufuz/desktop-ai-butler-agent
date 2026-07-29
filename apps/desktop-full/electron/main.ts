@@ -121,6 +121,25 @@ type ButlerWorkspaceData = {
   activities: ButlerActivity[]
 }
 
+type ScheduleEvent = {
+  id: string
+  planId?: string
+  title: string
+  description: string
+  date: string
+  start: string
+  end: string
+  category: 'focus' | 'meeting' | 'life' | 'deadline'
+  priority: 'low' | 'medium' | 'high'
+  flexible: boolean
+  progress: number
+  status: 'active' | 'done'
+  recurrence: 'none' | 'daily' | 'weekly'
+  nextAction?: string
+  createdAt: number
+  updatedAt: number
+}
+
 type StoredAgentRun = {
   id: string
   goal: string
@@ -559,6 +578,24 @@ function initializeDatabase() {
       text TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS schedule_events (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      event_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'focus',
+      priority TEXT NOT NULL DEFAULT 'medium',
+      flexible INTEGER NOT NULL DEFAULT 1,
+      progress INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      recurrence TEXT NOT NULL DEFAULT 'none',
+      next_action TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS memory_notes (
       id TEXT PRIMARY KEY,
       text TEXT NOT NULL,
@@ -614,6 +651,8 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_activities_created_at ON activities(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_date ON schedule_events(event_date, start_time);
+    CREATE INDEX IF NOT EXISTS idx_schedule_events_plan_id ON schedule_events(plan_id);
     CREATE INDEX IF NOT EXISTS idx_memory_notes_created_at ON memory_notes(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at ON agent_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
@@ -929,6 +968,145 @@ function readWorkspaceData(): ButlerWorkspaceData {
 function saveWorkspaceData(data: ButlerWorkspaceData) {
   replaceWorkspaceData(initializeDatabase(), data)
   return readWorkspaceData()
+}
+
+function readScheduleEvents(startDate?: string, endDate?: string): ScheduleEvent[] {
+  const hasRange = /^\d{4}-\d{2}-\d{2}$/.test(startDate ?? '')
+    && /^\d{4}-\d{2}-\d{2}$/.test(endDate ?? '')
+  type ScheduleEventRow = Omit<ScheduleEvent, 'planId' | 'flexible' | 'nextAction'> & {
+    planId: string | null
+    flexible: number
+    nextAction: string | null
+  }
+  const rangeQuery = `SELECT id, plan_id AS planId, title, description, event_date AS date,
+          start_time AS start, end_time AS end, category, priority, flexible,
+          progress, status, recurrence, next_action AS nextAction,
+          created_at AS createdAt, updated_at AS updatedAt
+        FROM schedule_events
+        WHERE event_date BETWEEN ? AND ?
+        ORDER BY event_date, start_time`
+  const allQuery = `SELECT id, plan_id AS planId, title, description, event_date AS date,
+            start_time AS start, end_time AS end, category, priority, flexible,
+            progress, status, recurrence, next_action AS nextAction,
+            created_at AS createdAt, updated_at AS updatedAt
+          FROM schedule_events
+          ORDER BY event_date, start_time
+          LIMIT 2000`
+  const rows = hasRange
+    ? initializeDatabase().prepare(rangeQuery).all(startDate as string, endDate as string) as ScheduleEventRow[]
+    : initializeDatabase().prepare(allQuery).all() as ScheduleEventRow[]
+  return rows.map((row) => ({
+    ...row,
+    planId: row.planId ?? undefined,
+    category: ['focus', 'meeting', 'life', 'deadline'].includes(row.category) ? row.category : 'focus',
+    priority: ['low', 'medium', 'high'].includes(row.priority) ? row.priority : 'medium',
+    flexible: Boolean(row.flexible),
+    progress: Math.max(0, Math.min(Number(row.progress) || 0, 100)),
+    status: row.status === 'done' ? 'done' : 'active',
+    recurrence: ['none', 'daily', 'weekly'].includes(row.recurrence) ? row.recurrence : 'none',
+    nextAction: row.nextAction ?? undefined,
+  }))
+}
+
+function normalizeScheduleEvent(value: unknown, existing?: ScheduleEvent): ScheduleEvent {
+  if (!value || typeof value !== 'object') throw new Error('日程参数无效')
+  const input = value as Partial<ScheduleEvent>
+  const date = typeof input.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(input.date)
+    ? input.date
+    : existing?.date
+  const start = typeof input.start === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input.start)
+    ? input.start
+    : existing?.start
+  const end = typeof input.end === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input.end)
+    ? input.end
+    : existing?.end
+  const title = typeof input.title === 'string' ? input.title.trim().slice(0, 300) : existing?.title
+  if (!date || !start || !end || end <= start || !title) throw new Error('日程需要有效的标题、日期和时间范围')
+  const now = Date.now()
+  return {
+    id: existing?.id ?? createId('schedule'),
+    planId: typeof input.planId === 'string' && input.planId.trim()
+      ? input.planId.trim().slice(0, 120)
+      : input.planId === undefined ? existing?.planId : undefined,
+    title,
+    description: typeof input.description === 'string'
+      ? input.description.trim().slice(0, 4000)
+      : existing?.description ?? '',
+    date,
+    start,
+    end,
+    category: input.category && ['focus', 'meeting', 'life', 'deadline'].includes(input.category)
+      ? input.category
+      : existing?.category ?? 'focus',
+    priority: input.priority && ['low', 'medium', 'high'].includes(input.priority)
+      ? input.priority
+      : existing?.priority ?? 'medium',
+    flexible: typeof input.flexible === 'boolean' ? input.flexible : existing?.flexible ?? true,
+    progress: typeof input.progress === 'number'
+      ? Math.max(0, Math.min(Math.round(input.progress), 100))
+      : existing?.progress ?? 0,
+    status: input.status === 'done' ? 'done' : input.status === 'active' ? 'active' : existing?.status ?? 'active',
+    recurrence: input.recurrence && ['none', 'daily', 'weekly'].includes(input.recurrence)
+      ? input.recurrence
+      : existing?.recurrence ?? 'none',
+    nextAction: typeof input.nextAction === 'string'
+      ? input.nextAction.trim().slice(0, 1000) || undefined
+      : existing?.nextAction,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  }
+}
+
+function saveScheduleEvent(value: unknown) {
+  const input = value as Partial<ScheduleEvent> | null
+  const existing = input?.id
+    ? readScheduleEvents().find((event) => event.id === String(input.id))
+    : undefined
+  const event = normalizeScheduleEvent(value, existing)
+  initializeDatabase()
+    .prepare(
+      `INSERT OR REPLACE INTO schedule_events
+        (id, plan_id, title, description, event_date, start_time, end_time, category,
+         priority, flexible, progress, status, recurrence, next_action, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      event.id,
+      event.planId ?? null,
+      event.title,
+      event.description,
+      event.date,
+      event.start,
+      event.end,
+      event.category,
+      event.priority,
+      event.flexible ? 1 : 0,
+      event.progress,
+      event.status,
+      event.recurrence,
+      event.nextAction ?? null,
+      event.createdAt,
+      event.updatedAt,
+    )
+  writeAuditLog({
+    category: 'workflow',
+    action: existing ? 'schedule.update' : 'schedule.create',
+    summary: `${existing ? '已更新' : '已创建'}日程：${event.title}`,
+    metadata: { eventId: event.id, planId: event.planId, date: event.date, start: event.start, end: event.end },
+  })
+  return event
+}
+
+function deleteScheduleEvent(eventId: string) {
+  const target = readScheduleEvents().find((event) => event.id === String(eventId))
+  const result = initializeDatabase().prepare('DELETE FROM schedule_events WHERE id = ?').run(String(eventId))
+  writeAuditLog({
+    category: 'workflow',
+    action: 'schedule.delete',
+    summary: `已删除日程：${target?.title ?? eventId}`,
+    metadata: { eventId, deleted: Number(result.changes) },
+  })
+  return { deleted: Number(result.changes) > 0, id: String(eventId) }
 }
 
 function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
@@ -1404,6 +1582,7 @@ async function exportUserData() {
     exportedAt: new Date().toISOString(),
     appVersion: getApplicationVersion(),
     workspace: readWorkspaceData(),
+    scheduleEvents: readScheduleEvents(),
     memoryNotes: readMemoryNotes(),
     knowledgeDocuments,
     agentRuns: readAgentRuns(),
@@ -1427,6 +1606,7 @@ function clearUserData() {
   try {
     db.exec(`
       DELETE FROM reports;
+      DELETE FROM schedule_events;
       DELETE FROM plans;
       DELETE FROM activities;
       DELETE FROM memory_notes;
@@ -1440,7 +1620,7 @@ function clearUserData() {
     writeAuditLog({ category: 'security', action: 'data.clear', summary: '清理本地工作数据失败', detail: error, status: 'failure' })
     throw error
   }
-  writeAuditLog({ level: 'warn', category: 'security', action: 'data.clear', summary: '已清理报告、计划、行动、记忆、知识库和 Agent 历史' })
+  writeAuditLog({ level: 'warn', category: 'security', action: 'data.clear', summary: '已清理报告、计划、日程、行动、记忆、知识库和 Agent 历史' })
   return { cleared: true }
 }
 
@@ -2591,6 +2771,18 @@ ipcMain.handle('workflow:get-data', () => {
   return readWorkspaceData()
 })
 
+ipcMain.handle('schedule:list', (_event, startDate?: string, endDate?: string) => {
+  return readScheduleEvents(startDate, endDate)
+})
+
+ipcMain.handle('schedule:save', (_event, scheduleEvent: unknown) => {
+  return saveScheduleEvent(scheduleEvent)
+})
+
+ipcMain.handle('schedule:delete', (_event, eventId: string) => {
+  return deleteScheduleEvent(eventId)
+})
+
 ipcMain.handle('agent-runs:list', () => {
   return readAgentRuns()
 })
@@ -2773,6 +2965,9 @@ ipcMain.handle('workflow:delete-plan', (_event, planId: string) => {
   const data = readWorkspaceData()
   const targetPlan = data.plans.find((plan) => plan.id === planId)
   data.plans = data.plans.filter((plan) => plan.id !== planId)
+  initializeDatabase()
+    .prepare('UPDATE schedule_events SET plan_id = NULL, updated_at = ? WHERE plan_id = ?')
+    .run(Date.now(), planId)
   appendActivity(data, {
     type: 'plan',
     text: `删除计划：${targetPlan?.title ?? planId}`,

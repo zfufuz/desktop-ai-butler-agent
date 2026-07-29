@@ -1,7 +1,14 @@
 // 内置 Tool 注册表：声明 Agent 可选择的工具名称、用途、风险和输入 Schema。
 import type { AgentToolDefinition } from './protocol'
 
-export type ToolName = 'getSystemInfo' | 'getAppVersion' | 'pickTextFile' | 'queryKnowledgeBase'
+export type ToolName =
+  | 'getSystemInfo'
+  | 'getAppVersion'
+  | 'pickTextFile'
+  | 'queryKnowledgeBase'
+  | 'listSchedule'
+  | 'findFreeTime'
+  | 'createScheduleEvent'
 
 export type ToolDefinition = AgentToolDefinition<ToolName>
 
@@ -56,6 +63,58 @@ export const toolRegistry: ToolDefinition[] = [
         query: { type: 'string', description: '用于检索本地知识库的问题或关键词' },
       },
       required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'listSchedule',
+    label: '查看时间安排',
+    description: '读取指定日期的本地日程，用于回答今天有什么安排、下一项任务是什么。日期格式为 YYYY-MM-DD。',
+    riskLevel: 'low',
+    requiresPermission: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: '要查询的日期，格式为 YYYY-MM-DD' },
+      },
+      required: ['date'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'findFreeTime',
+    label: '查找空闲时间',
+    description: '根据已有日程，在指定日期工作时段内查找可用空档。只计算，不写入数据。',
+    riskLevel: 'low',
+    requiresPermission: false,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: '目标日期，格式为 YYYY-MM-DD' },
+        durationMinutes: { type: 'number', description: '需要的连续分钟数' },
+      },
+      required: ['date', 'durationMinutes'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'createScheduleEvent',
+    label: '创建日程',
+    description: '把任务或计划安排到本地日历。写入前需要用户确认，遇到冲突时自动寻找相同日期的可用空档。',
+    riskLevel: 'medium',
+    requiresPermission: true,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '日程标题' },
+        description: { type: 'string', description: '日程说明' },
+        date: { type: 'string', description: '日期，格式为 YYYY-MM-DD' },
+        start: { type: 'string', description: '开始时间，格式为 HH:mm' },
+        end: { type: 'string', description: '结束时间，格式为 HH:mm' },
+        category: { type: 'string', description: '类型：focus、meeting、life 或 deadline' },
+        flexible: { type: 'boolean', description: '发生冲突时是否允许调整到空档' },
+      },
+      required: ['title', 'date', 'start', 'end'],
       additionalProperties: false,
     },
   },

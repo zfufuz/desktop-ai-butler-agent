@@ -10,6 +10,12 @@ import type {
 } from '../agent/protocol'
 import { toolRegistry, type ToolName } from '../agent/toolRegistry'
 import { wrapUntrustedCollection, wrapUntrustedContent } from '../agent/security'
+import {
+  findAvailableSlot,
+  findScheduleConflicts,
+  getEventDuration,
+  type ScheduleEvent,
+} from '../schedule/scheduleEngine'
 import { createAssistantReply, streamAssistantReply, type AssistantReply } from './assistant'
 
 export type ToolCallStatus = 'success' | 'error'
@@ -97,6 +103,23 @@ function shouldUseKnowledgeBaseTool(userText: string) {
   return /知识库|资料|文档|根据.*回答|rag|knowledge|项目背景|架构/i.test(userText)
 }
 
+function shouldListSchedule(userText: string) {
+  return (/日程|安排|下一项|时间表|calendar|schedule/i.test(userText)
+    || /(今天|明天).*(做什么|什么任务|有什么安排)/i.test(userText))
+    && !/创建|新增|安排到|加入日程/i.test(userText)
+}
+
+function shouldFindFreeTime(userText: string) {
+  return /空闲|空档|有时间|几点有空|find.*time|free.*time/i.test(userText)
+}
+
+function currentDateKey(offsetDays = 0) {
+  const date = new Date()
+  date.setDate(date.getDate() + offsetDays)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
 function extractJsonObject(text: string) {
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
@@ -113,6 +136,14 @@ function getFallbackCalls(userText: string): AgentToolCall[] {
   if (shouldUseAppVersionTool(userText)) add('getAppVersion')
   if (shouldUseFileTool(userText)) add('pickTextFile', { purpose: '读取用户指定的本地文件' })
   if (shouldUseKnowledgeBaseTool(userText)) add('queryKnowledgeBase', { query: userText })
+  if (shouldFindFreeTime(userText)) {
+    add('findFreeTime', {
+      date: /明天/.test(userText) ? currentDateKey(1) : currentDateKey(),
+      durationMinutes: 60,
+    })
+  } else if (shouldListSchedule(userText)) {
+    add('listSchedule', { date: /明天/.test(userText) ? currentDateKey(1) : currentDateKey() })
+  }
   return calls
 }
 
@@ -265,6 +296,75 @@ async function executeTool(
     return succeed(
       `命中 ${results.length} 个片段 / ${sourceNames.join('、')}`,
       `本地知识库检索结果：\n\n${context}\n\n回答时请引用 [1]、[2] 这样的来源编号。`,
+    )
+  }
+
+  if (call.name === 'listSchedule') {
+    const date = String(call.input.date ?? currentDateKey())
+    const events = (await window.electronAPI.getScheduleEvents(date, date))
+      .filter((event) => event.status === 'active')
+    if (events.length === 0) return succeed('当天没有日程', `${date} 暂无日程安排。`)
+    return succeed(
+      `读取 ${events.length} 项日程`,
+      `${date} 日程：\n${events.map((event) => `- ${event.start}–${event.end} ${event.title}（${event.progress}%）`).join('\n')}`,
+    )
+  }
+
+  if (call.name === 'findFreeTime') {
+    const date = String(call.input.date ?? currentDateKey())
+    const durationMinutes = Math.max(15, Math.min(Number(call.input.durationMinutes) || 60, 8 * 60))
+    const events = await window.electronAPI.getScheduleEvents(date, date)
+    const slot = findAvailableSlot(events, date, durationMinutes)
+    if (!slot) return fail(`${date} 没有 ${durationMinutes} 分钟连续空档`)
+    return succeed(
+      `找到 ${durationMinutes} 分钟空档`,
+      `${date} 可用时间：${slot.start}–${slot.end}，连续 ${durationMinutes} 分钟。`,
+    )
+  }
+
+  if (call.name === 'createScheduleEvent') {
+    const title = String(call.input.title ?? '').trim()
+    const date = String(call.input.date ?? '')
+    const start = String(call.input.start ?? '')
+    const end = String(call.input.end ?? '')
+    if (!title || !date || !start || !end) return fail('创建日程缺少标题、日期或时间')
+    const allowed = await options.requestPermission(
+      'createScheduleEvent',
+      `准备创建日程“${title}”：${date} ${start}–${end}`,
+    )
+    if (!allowed) return fail('用户拒绝创建日程')
+    const currentEvents = await window.electronAPI.getScheduleEvents(date, date)
+    const categoryValue = String(call.input.category ?? 'focus')
+    const candidate: ScheduleEvent = {
+      id: '__candidate__',
+      title,
+      description: String(call.input.description ?? ''),
+      date,
+      start,
+      end,
+      category: ['focus', 'meeting', 'life', 'deadline'].includes(categoryValue)
+        ? categoryValue as ScheduleEvent['category']
+        : 'focus',
+      priority: 'medium',
+      flexible: call.input.flexible !== false,
+      progress: 0,
+      status: 'active',
+      recurrence: 'none',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    const conflicts = findScheduleConflicts(currentEvents, candidate)
+    let adjusted = candidate
+    if (conflicts.length > 0) {
+      if (!candidate.flexible) return fail(`与“${conflicts[0].title}”冲突，且该日程不允许自动调整`)
+      const slot = findAvailableSlot(currentEvents, date, getEventDuration(candidate))
+      if (!slot) return fail('检测到时间冲突，且当天没有足够空档')
+      adjusted = { ...candidate, ...slot }
+    }
+    const saved = await window.electronAPI.saveScheduleEvent(adjusted)
+    return succeed(
+      `已创建日程：${saved.title}`,
+      `已写入本地日历：${saved.date} ${saved.start}–${saved.end} ${saved.title}${conflicts.length > 0 ? '（已避开冲突）' : ''}`,
     )
   }
 

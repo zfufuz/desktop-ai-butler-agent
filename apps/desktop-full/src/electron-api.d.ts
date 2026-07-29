@@ -155,6 +155,25 @@ type ButlerWorkspaceData = {
   activities: ButlerActivity[]
 }
 
+type ScheduleEvent = {
+  id: string
+  planId?: string
+  title: string
+  description: string
+  date: string
+  start: string
+  end: string
+  category: 'focus' | 'meeting' | 'life' | 'deadline'
+  priority: 'low' | 'medium' | 'high'
+  flexible: boolean
+  progress: number
+  status: 'active' | 'done'
+  recurrence: 'none' | 'daily' | 'weekly'
+  nextAction?: string
+  createdAt: number
+  updatedAt: number
+}
+
 type AgentRunSnapshot = {
   id: string
   goal: string
@@ -286,6 +305,9 @@ declare global {
       ) => Promise<ButlerWorkspaceData>
       updatePlan: (planId: string, patch: Partial<ButlerPlan>) => Promise<ButlerWorkspaceData>
       deletePlan: (planId: string) => Promise<ButlerWorkspaceData>
+      getScheduleEvents: (startDate?: string, endDate?: string) => Promise<ScheduleEvent[]>
+      saveScheduleEvent: (scheduleEvent: Partial<ScheduleEvent> & Pick<ScheduleEvent, 'title' | 'date' | 'start' | 'end'>) => Promise<ScheduleEvent>
+      deleteScheduleEvent: (eventId: string) => Promise<{ deleted: boolean; id: string }>
       checkinPlan: (planId: string, note: string, progress?: number) => Promise<ButlerWorkspaceData>
       addActivity: (text: string) => Promise<ButlerWorkspaceData>
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>

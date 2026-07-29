@@ -32,6 +32,7 @@ import KnowledgePanel, {
   type KnowledgeSearchResult,
 } from './components/KnowledgePanel'
 import MessageList from './components/MessageList'
+import { SchedulePanel } from './components/SchedulePanel'
 import { createAssistantReply } from './services/assistant'
 import {
   runAgent,
@@ -49,7 +50,7 @@ type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
 type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'activity' | 'memory'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -2900,6 +2901,18 @@ ${result.content}
   }
 
   function renderWorkspaceDetail() {
+    if (workspacePage === 'schedule') {
+      return (
+        <SchedulePanel
+          plans={workflowData.plans}
+          onClose={() => setWorkspacePage('home')}
+          onWorkflowChange={async () => {
+            setWorkflowData(await window.electronAPI.getWorkflowData())
+          }}
+        />
+      )
+    }
+
     if (workspacePage === 'data') {
       return (
         <div className="insight-section">
@@ -3104,6 +3117,9 @@ ${result.content}
                     <button onClick={() => startProgressRecord(plan)} disabled={plan.status === 'done'}>
                       记录进度
                     </button>
+                    <button onClick={() => setWorkspacePage('schedule')} disabled={plan.status === 'done'}>
+                      <CalendarPlus aria-hidden="true" size={15} />安排日程
+                    </button>
                     <button className="pin-action" onClick={() => openFloatingPlan(plan.id)} disabled={!isElectronReady}>
                       <Pin aria-hidden="true" size={15} />固定到桌面
                     </button>
@@ -3237,6 +3253,10 @@ ${result.content}
         <button className="settings-entry workspace-entry highlight" onClick={() => setWorkspacePage('plans')}>
           <span><strong>今日任务</strong><small>今天要推进的计划、提醒和停滞项。</small></span>
           <b>{todayPlans.length} 个</b>
+        </button>
+        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('schedule')}>
+          <span><strong>时间规划</strong><small>安排日程、检测冲突并智能重排。</small></span>
+          <b>日 / 周</b>
         </button>
         <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('reports')}>
           <span><strong>报告</strong><small>查看分析结论并固定为桌面行动卡。</small></span>
