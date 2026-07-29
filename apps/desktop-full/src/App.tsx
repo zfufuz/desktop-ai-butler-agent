@@ -3289,7 +3289,7 @@ ${result.content}
 
   return (
     <main
-      className={`app-shell user-mode ${isDraggingFile ? 'dragging-file' : ''}`}
+      className={`app-shell user-mode ${isDraggingFile ? 'dragging-file' : ''} ${leftPanelCollapsed ? 'left-panel-collapsed' : ''} ${rightPanelCollapsed ? 'right-panel-collapsed' : ''}`}
       style={{
         gridTemplateColumns: `${leftPanelCollapsed ? 44 : leftPanelWidth}px 6px minmax(420px, 1fr) 6px ${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
       }}

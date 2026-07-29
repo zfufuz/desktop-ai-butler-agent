@@ -2300,6 +2300,18 @@ button:hover:not(:disabled) {
     grid-template-columns: 220px 6px minmax(360px, 1fr) 6px 300px !important;
   }
 
+  .app-shell.left-panel-collapsed {
+    grid-template-columns: 44px 0 minmax(360px, 1fr) 6px 300px !important;
+  }
+
+  .app-shell.right-panel-collapsed {
+    grid-template-columns: 220px 6px minmax(360px, 1fr) 0 44px !important;
+  }
+
+  .app-shell.left-panel-collapsed.right-panel-collapsed {
+    grid-template-columns: 44px 0 minmax(360px, 1fr) 0 44px !important;
+  }
+
   .chat-header {
     align-items: stretch;
     flex-direction: column;
