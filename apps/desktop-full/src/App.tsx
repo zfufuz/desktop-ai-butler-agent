@@ -3266,27 +3266,31 @@ ${result.content}
 
   function renderCoreWorkspaceHome() {
     return (
-      <div className="core-workspace-grid">
-        <button className="settings-entry workspace-entry highlight" onClick={() => setWorkspacePage('plans')}>
-          <span><strong>今日任务</strong><small>今天要推进的计划、提醒和停滞项。</small></span>
-          <b>{todayPlans.length} 个</b>
-        </button>
-        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('schedule')}>
-          <span><strong>时间规划</strong><small>安排日程、检测冲突并智能重排。</small></span>
-          <b>日 / 周</b>
-        </button>
-        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('reports')}>
-          <span><strong>报告</strong><small>查看分析结论并固定为桌面行动卡。</small></span>
-          <b>{workflowData.reports.length} 份</b>
-        </button>
-        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('plans')}>
-          <span><strong>计划</strong><small>记录进度、AI 复盘并调整下一步。</small></span>
-          <b>{activePlans.length} 个</b>
-        </button>
-        <button className="settings-entry workspace-entry" onClick={() => setWorkspacePage('knowledge')}>
-          <span><strong>资料库</strong><small>管理本地资料和来源检索。</small></span>
-          <b>{knowledgeIndex.length} 份</b>
-        </button>
+      <div className="workspace-overview">
+        <section className="today-focus">
+          <span className="eyebrow">Today</span>
+          <strong>{todayPlans.length > 0 ? `${todayPlans.length} 项任务等待推进` : '今天还没有待处理任务'}</strong>
+          <p>{stalePlans.length > 0 ? `${stalePlans.length} 个计划已经停滞，建议先记录进度或重新拆分。` : '从文件分析、报告或对话中创建下一步行动。'}</p>
+          <button onClick={() => setWorkspacePage('plans')}>{todayPlans.length > 0 ? '查看今日任务' : '创建第一个计划'}</button>
+        </section>
+
+        <div className="workspace-stats" aria-label="工作台摘要">
+          <span><strong>{activePlans.length}</strong><small>进行中计划</small></span>
+          <span><strong>{workflowData.reports.length}</strong><small>已保存报告</small></span>
+          <span><strong>{knowledgeIndex.length}</strong><small>资料文件</small></span>
+        </div>
+
+        <div className="workspace-action-list">
+          <button onClick={() => setWorkspacePage('schedule')}>
+            <span><strong>时间规划</strong><small>日程、冲突检测与智能重排</small></span><b>日 / 周</b>
+          </button>
+          <button onClick={() => setWorkspacePage('reports')}>
+            <span><strong>报告中心</strong><small>查看结论或固定到桌面边缘</small></span><b>{workflowData.reports.length}</b>
+          </button>
+          <button onClick={() => setWorkspacePage('knowledge')}>
+            <span><strong>资料与来源</strong><small>管理本地资料和检索结果</small></span><b>{knowledgeIndex.length}</b>
+          </button>
+        </div>
       </div>
     )
   }
@@ -3353,6 +3357,13 @@ ${result.content}
             appVersion={appVersion}
             systemInfoText={systemInfoText}
             statusText={getAssistantStatusText(assistantStatus)}
+            activePage={workspacePage}
+            onNavigate={(page) => {
+              setWorkspacePage(page)
+              if (page === 'home') {
+                window.requestAnimationFrame(() => inputRef.current?.focus())
+              }
+            }}
           />
         )}
       </aside>
@@ -3523,27 +3534,40 @@ ${result.content}
         </button>
         {!rightPanelCollapsed && (
           <>
-        <h2>管家工作台</h2>
-
-        <div className="insight-section status-card">
-          <h3>当前状态</h3>
-          <ul>
-            <li>桌面连接：{isElectronReady ? '已连接' : '未连接'}</li>
-            <li title={[backendStatus?.detail, backendStatus?.framework, backendStatus?.agentFramework, backendStatus?.orchestration].filter(Boolean).join(' / ')}>
-              Agent 后端：{backendStatus?.state === 'ready'
-                ? 'FastAPI + LangChain + LangGraph'
-                : backendStatus?.state === 'starting' ? '启动中' : 'TypeScript 降级模式'}
-            </li>
-            <li>当前模型：{activeProvider?.name ?? '加载中'}</li>
-            <li>资料库：{knowledgeIndex.length} 份文件</li>
-            <li>计划：{activePlans.length} 个进行中 / {finishedPlans.length} 个完成</li>
-          </ul>
-        </div>
-
         {mode === 'user' ? (
-          renderUserWorkspacePanel()
+          <>
+            <div className="workspace-panel-heading">
+              <div>
+                <span className="eyebrow">Workspace</span>
+                <h2>工作台</h2>
+              </div>
+              <span className="workspace-summary">{todayPlans.length} 项待处理</span>
+            </div>
+            <nav className="workspace-tabs" aria-label="工作台视图">
+              <button className={workspacePage === 'home' ? 'active' : ''} onClick={() => setWorkspacePage('home')}>概览</button>
+              <button className={workspacePage === 'plans' || workspacePage === 'schedule' ? 'active' : ''} onClick={() => setWorkspacePage('plans')}>任务</button>
+              <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>资料</button>
+              <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
+            </nav>
+            {renderUserWorkspacePanel()}
+          </>
         ) : (
           <>
+            <h2>开发者控制台</h2>
+            <div className="insight-section status-card">
+              <h3>系统诊断</h3>
+              <ul>
+                <li>桌面连接：{isElectronReady ? '已连接' : '未连接'}</li>
+                <li title={[backendStatus?.detail, backendStatus?.framework, backendStatus?.agentFramework, backendStatus?.orchestration].filter(Boolean).join(' / ')}>
+                  Agent 后端：{backendStatus?.state === 'ready'
+                    ? 'FastAPI + LangChain + LangGraph'
+                    : backendStatus?.state === 'starting' ? '启动中' : 'TypeScript 降级模式'}
+                </li>
+                <li>当前模型：{activeProvider?.name ?? '加载中'}</li>
+                <li>资料库：{knowledgeIndex.length} 份文件</li>
+                <li>计划：{activePlans.length} 个进行中 / {finishedPlans.length} 个完成</li>
+              </ul>
+            </div>
             <div className="insight-section">
               <h3>开发者能力</h3>
               <ul>
@@ -3776,6 +3800,14 @@ ${result.content}
               <div className="settings-block settings-category-grid">
                 <h3>高级设置</h3>
                 <p className="settings-help">面向调试、检索优化和 Agent 效果验证的技术选项。</p>
+                <div className="settings-diagnostic-card">
+                  <span><small>桌面连接</small><strong>{isElectronReady ? '已连接' : '未连接'}</strong></span>
+                  <span title={[backendStatus?.detail, backendStatus?.framework, backendStatus?.agentFramework, backendStatus?.orchestration].filter(Boolean).join(' / ')}>
+                    <small>Agent 后端</small>
+                    <strong>{backendStatus?.state === 'ready' ? 'Python 服务就绪' : backendStatus?.state === 'starting' ? '启动中' : '降级模式'}</strong>
+                  </span>
+                  <span><small>当前模型</small><strong>{activeProvider?.name ?? '加载中'}</strong></span>
+                </div>
                 <button className="settings-entry" onClick={() => setSettingsPage('rag')}>
                   <span><strong>RAG 检索</strong><small>Embedding、混合检索、Reranker 和上下文压缩。</small></span>
                   <b>{platformConfig?.rag.embeddingEnabled ? '混合' : 'BM25'}</b>

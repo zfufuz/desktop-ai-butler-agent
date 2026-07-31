@@ -335,9 +335,43 @@ button:hover:not(:disabled) {
 .avatar-meta {
   display: grid;
   gap: 10px;
+  margin-top: auto;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   padding: 16px 0;
+}
+
+.avatar-navigation {
+  display: grid;
+  gap: 5px;
+  margin: 2px -8px 0;
+}
+
+.avatar-navigation button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #aebdb8;
+  padding: 9px 11px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.avatar-navigation button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: #ffffff;
+  transform: none;
+}
+
+.avatar-navigation button.active {
+  background: rgba(45, 212, 191, 0.14);
+  color: #73e7d6;
 }
 
 .avatar-meta span {
@@ -953,6 +987,209 @@ button:hover:not(:disabled) {
   color: #0f172a;
   font-size: 20px;
   padding-left: 24px;
+}
+
+.workspace-panel-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding-left: 24px;
+}
+
+.workspace-panel-heading .eyebrow {
+  margin-bottom: 3px;
+}
+
+.workspace-panel-heading h2 {
+  margin: 0;
+  padding: 0;
+}
+
+.workspace-summary {
+  color: #64748b;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.workspace-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  background: #eef2f1;
+  padding: 4px;
+}
+
+.workspace-tabs button {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #64748b;
+  padding: 8px 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.workspace-tabs button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.7);
+  transform: none;
+}
+
+.workspace-tabs button.active {
+  background: #ffffff;
+  color: #0f766e;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+
+.workspace-overview {
+  display: grid;
+  gap: 14px;
+}
+
+.today-focus {
+  border-left: 3px solid #14b8a6;
+  background: #edf9f7;
+  padding: 14px 14px 14px 16px;
+}
+
+.today-focus .eyebrow {
+  margin: 0 0 8px;
+}
+
+.today-focus strong,
+.today-focus p {
+  display: block;
+}
+
+.today-focus > strong {
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.today-focus p {
+  margin: 7px 0 12px;
+  color: #52625e;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.today-focus button {
+  border: 0;
+  border-radius: 7px;
+  background: #0f766e;
+  color: #ffffff;
+  padding: 8px 11px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.workspace-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.22);
+}
+
+.workspace-stats span {
+  display: grid;
+  gap: 3px;
+  background: #ffffff;
+  padding: 10px 7px;
+  text-align: center;
+}
+
+.workspace-stats strong {
+  color: #0f172a;
+  font-size: 17px;
+}
+
+.workspace-stats small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.workspace-action-list {
+  display: grid;
+}
+
+.workspace-action-list > button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  background: transparent;
+  color: #0f172a;
+  padding: 11px 4px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.workspace-action-list > button:hover:not(:disabled) {
+  background: #f0f7f5;
+  transform: none;
+}
+
+.workspace-action-list span {
+  display: grid;
+  gap: 3px;
+}
+
+.workspace-action-list small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.workspace-action-list b {
+  color: #0f766e;
+  font-size: 12px;
+}
+
+.settings-diagnostic-card {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin-bottom: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.2);
+}
+
+.settings-diagnostic-card span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.settings-diagnostic-card small,
+.settings-diagnostic-card strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-diagnostic-card small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.settings-diagnostic-card strong {
+  color: #0f172a;
+  font-size: 12px;
 }
 
 .insight-section {
