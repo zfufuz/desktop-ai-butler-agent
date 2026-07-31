@@ -1,5 +1,7 @@
 ﻿import { useEffect, useRef, useState } from 'react'
 // 主应用工作台：协调聊天、文件、出差、报告、计划、设置和 Agent 可观测状态。
+import { lazy, Suspense } from 'react'
+import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels'
 import {
   ChevronLeft,
   ChevronRight,
@@ -20,7 +22,6 @@ import {
 import './App.css'
 import AvatarPanel from './components/AvatarPanel'
 import AgentRunsPanel, { type AgentRunSnapshot } from './components/AgentRunsPanel'
-import MetricsPanel from './components/MetricsPanel'
 import AuditLogPanel, {
   type AuditLogEntry,
   type AuditLogFilters,
@@ -45,6 +46,8 @@ import type { AgentRun } from './agent/protocol'
 import { wrapUntrustedCollection, wrapUntrustedContent } from './agent/security'
 import { getSkillDefinition, skillRegistry, type SkillId } from './skills/skillRegistry'
 import type { AssistantStatus, Message } from './type'
+
+const MetricsPanel = lazy(() => import('./components/MetricsPanel'))
 
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
@@ -566,6 +569,8 @@ function App() {
   const [rightPanelWidth, setRightPanelWidth] = useState(() => Number(localStorage.getItem('ai-butler:rightPanelWidth')) || 340)
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() => localStorage.getItem('ai-butler:leftPanelCollapsed') === 'true')
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => localStorage.getItem('ai-butler:rightPanelCollapsed') === 'true')
+  const leftPanelRef = usePanelRef()
+  const rightPanelRef = usePanelRef()
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null)
   const [editingToolId, setEditingToolId] = useState<string | null>(null)
   const [pendingFileReadStep, setPendingFileReadStep] = useState<PendingFileReadStep>(() =>
@@ -860,6 +865,29 @@ function App() {
   useEffect(() => {
     localStorage.setItem('ai-butler:rightPanelCollapsed', String(rightPanelCollapsed))
   }, [rightPanelCollapsed])
+
+  useEffect(() => {
+    const syncCompactLayout = () => {
+      if (window.innerWidth < 900) {
+        leftPanelRef.current?.collapse()
+        rightPanelRef.current?.collapse()
+      } else if (window.innerWidth < 1180) {
+        leftPanelRef.current?.collapse()
+      }
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      if (leftPanelCollapsed) leftPanelRef.current?.collapse()
+      if (rightPanelCollapsed) rightPanelRef.current?.collapse()
+      syncCompactLayout()
+    })
+    window.addEventListener('resize', syncCompactLayout)
+
+    return () => {
+      window.cancelAnimationFrame(frameId)
+      window.removeEventListener('resize', syncCompactLayout)
+    }
+  }, [leftPanelCollapsed, leftPanelRef, rightPanelCollapsed, rightPanelRef])
 
   useEffect(() => {
     if (!isElectronReady) {
@@ -1948,30 +1976,15 @@ ${fileContext}`,
     await analyzeDroppedFiles(event.dataTransfer.files)
   }
 
-  function startResizePanel(side: 'left' | 'right', event: any) {
-    event.preventDefault()
-    const startX = event.clientX
-    const startWidth = side === 'left' ? leftPanelWidth : rightPanelWidth
+  function toggleSidePanel(side: 'left' | 'right') {
+    const panel = side === 'left' ? leftPanelRef.current : rightPanelRef.current
+    if (!panel) return
 
-    const handleMouseMove = (moveEvent: MouseEvent) => {
-      const delta = moveEvent.clientX - startX
-      const nextWidth = side === 'left' ? startWidth + delta : startWidth - delta
-      const clampedWidth = Math.min(520, Math.max(220, nextWidth))
-
-      if (side === 'left') {
-        setLeftPanelWidth(clampedWidth)
-      } else {
-        setRightPanelWidth(clampedWidth)
-      }
+    if (panel.isCollapsed()) {
+      panel.expand()
+    } else {
+      panel.collapse()
     }
-
-    const handleMouseUp = () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', handleMouseUp)
-    }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', handleMouseUp)
   }
 
   async function importKnowledgeDocument() {
@@ -2951,7 +2964,11 @@ ${result.content}
     }
 
     if (workspacePage === 'metrics') {
-      return <MetricsPanel runs={agentRuns} logs={auditLogs} />
+      return (
+        <Suspense fallback={<div className="panel-loading">正在加载指标面板...</div>}>
+          <MetricsPanel runs={agentRuns} logs={auditLogs} />
+        </Suspense>
+      )
     }
 
     if (workspacePage === 'eval') {
@@ -3290,9 +3307,6 @@ ${result.content}
   return (
     <main
       className={`app-shell user-mode ${isDraggingFile ? 'dragging-file' : ''} ${leftPanelCollapsed ? 'left-panel-collapsed' : ''} ${rightPanelCollapsed ? 'right-panel-collapsed' : ''}`}
-      style={{
-        gridTemplateColumns: `${leftPanelCollapsed ? 44 : leftPanelWidth}px 6px minmax(420px, 1fr) 6px ${rightPanelCollapsed ? 44 : rightPanelWidth}px`,
-      }}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -3309,10 +3323,26 @@ ${result.content}
         </div>
       )}
 
+      <Group className="workspace-panels" orientation="horizontal">
+      <Panel
+        id="assistant-profile"
+        panelRef={leftPanelRef}
+        defaultSize={leftPanelCollapsed ? 44 : leftPanelWidth}
+        minSize={220}
+        maxSize={520}
+        collapsedSize={44}
+        collapsible
+        groupResizeBehavior="preserve-pixel-size"
+        onResize={({ inPixels }) => {
+          const collapsed = inPixels <= 60
+          setLeftPanelCollapsed(collapsed)
+          if (!collapsed) setLeftPanelWidth(Math.round(inPixels))
+        }}
+      >
       <aside className={`panel-shell left-shell ${leftPanelCollapsed ? 'collapsed' : ''}`}>
         <button
           className="panel-collapse-button"
-          onClick={() => setLeftPanelCollapsed((currentValue) => !currentValue)}
+          onClick={() => toggleSidePanel('left')}
           title={leftPanelCollapsed ? '展开左侧管家面板' : '折叠左侧管家面板'}
         >
           {leftPanelCollapsed ? <ChevronRight aria-hidden="true" size={16} /> : <ChevronLeft aria-hidden="true" size={16} />}
@@ -3326,12 +3356,14 @@ ${result.content}
           />
         )}
       </aside>
+      </Panel>
 
-      <div
+      <Separator
         className={`resize-handle left-resize ${leftPanelCollapsed ? 'disabled' : ''}`}
-        onMouseDown={(event) => !leftPanelCollapsed && startResizePanel('left', event)}
+        disabled={leftPanelCollapsed}
       />
 
+      <Panel id="conversation" minSize={420}>
       <section className="chat-panel">
         <header className="chat-header">
           <div>
@@ -3459,16 +3491,32 @@ ${result.content}
           onRemoveAttachment={removePendingAttachment}
         />
       </section>
+      </Panel>
 
-      <div
+      <Separator
         className={`resize-handle right-resize ${rightPanelCollapsed ? 'disabled' : ''}`}
-        onMouseDown={(event) => !rightPanelCollapsed && startResizePanel('right', event)}
+        disabled={rightPanelCollapsed}
       />
 
+      <Panel
+        id="workspace-inspector"
+        panelRef={rightPanelRef}
+        defaultSize={rightPanelCollapsed ? 44 : rightPanelWidth}
+        minSize={280}
+        maxSize={560}
+        collapsedSize={44}
+        collapsible
+        groupResizeBehavior="preserve-pixel-size"
+        onResize={({ inPixels }) => {
+          const collapsed = inPixels <= 60
+          setRightPanelCollapsed(collapsed)
+          if (!collapsed) setRightPanelWidth(Math.round(inPixels))
+        }}
+      >
       <aside className={`insight-panel ${rightPanelCollapsed ? 'collapsed' : ''}`}>
         <button
           className="panel-collapse-button right"
-          onClick={() => setRightPanelCollapsed((currentValue) => !currentValue)}
+          onClick={() => toggleSidePanel('right')}
           title={rightPanelCollapsed ? '展开右侧工作台' : '折叠右侧工作台'}
         >
           {rightPanelCollapsed ? <ChevronLeft aria-hidden="true" size={16} /> : <ChevronRight aria-hidden="true" size={16} />}
@@ -3591,6 +3639,8 @@ ${result.content}
           </>
         )}
       </aside>
+      </Panel>
+      </Group>
 
       {tripPlannerOpen && (
         <div className="settings-overlay trip-planner-overlay" role="presentation">

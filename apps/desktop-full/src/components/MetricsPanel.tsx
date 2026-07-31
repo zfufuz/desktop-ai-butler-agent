@@ -1,54 +1,129 @@
-// 指标面板：从真实 Agent Run 和 SQLite 审计日志聚合成功率、延迟与 Token。
+// 指标面板：将真实 Agent Run 与 SQLite 审计日志聚合为可核验的运行指标。
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
+import { Activity, Clock3, Gauge, Wrench } from 'lucide-react'
+import { buildAgentMetrics } from '../lib/agentMetrics'
 import type { AgentRunSnapshot } from './AgentRunsPanel'
 import type { AuditLogEntry } from './AuditLogPanel'
 
-const percent = (value: number, total: number) => total === 0 ? '暂无数据' : `${Math.round(value / total * 100)}%`
-const percentile = (values: number[], point: number) => {
-  if (values.length === 0) return null
-  const sorted = [...values].sort((a, b) => a - b)
-  return sorted[Math.max(0, Math.ceil(sorted.length * point) - 1)]
+const displayPercent = (value: number | null) => value === null ? '暂无数据' : `${value}%`
+const displayDuration = (value: number | null) => value === null ? '暂无数据' : `${value} ms`
+
+export default function MetricsPanel({
+  runs,
+  logs,
+}: {
+  runs: AgentRunSnapshot[]
+  logs: AuditLogEntry[]
+}) {
+  const metrics = buildAgentMetrics(runs, logs)
+  const statCards = [
+    {
+      label: '任务完成率',
+      value: displayPercent(metrics.completionRate),
+      icon: <Gauge size={17} />,
+    },
+    {
+      label: 'Tool 成功率',
+      value: displayPercent(metrics.toolSuccessRate),
+      icon: <Wrench size={17} />,
+    },
+    {
+      label: '平均执行轮数',
+      value: metrics.averageTurns === null ? '暂无数据' : metrics.averageTurns.toFixed(1),
+      icon: <Activity size={17} />,
+    },
+    {
+      label: '首字延迟 P50',
+      value: displayDuration(metrics.p50FirstToken),
+      icon: <Clock3 size={17} />,
+    },
+    {
+      label: '响应时间 P50',
+      value: displayDuration(metrics.p50Duration),
+      icon: <Clock3 size={17} />,
+    },
+    {
+      label: '响应时间 P95',
+      value: displayDuration(metrics.p95Duration),
+      icon: <Clock3 size={17} />,
+    },
+    {
+      label: '累计 Token',
+      value: metrics.totalTokens === 0 ? '暂无数据' : metrics.totalTokens.toLocaleString('zh-CN'),
+      icon: <Activity size={17} />,
+    },
+  ]
+
+  return (
+    <div className="insight-section metrics-panel">
+      <div className="section-heading">
+        <div>
+          <h3>Agent 指标</h3>
+          <p>数据来自本地运行记录和审计日志，不使用模拟分数。</p>
+        </div>
+      </div>
+
+      <div className="metrics-stat-grid">
+        {statCards.map((item) => (
+          <div className="metric-stat" key={item.label}>
+            <span className="metric-icon">{item.icon}</span>
+            <strong>{item.value}</strong>
+            <small>{item.label}</small>
+          </div>
+        ))}
+      </div>
+
+      {metrics.estimatedTokenRuns > 0 && (
+        <p className="metrics-note">
+          其中 {metrics.estimatedTokenRuns} 次模型调用使用估算 Token。
+        </p>
+      )}
+
+      <div className="metrics-chart-grid">
+        <MetricChart title="失败原因" data={metrics.failureData} emptyText="暂无失败记录" color="#dc6b4a" />
+        <MetricChart title="RAG 检索模式" data={metrics.ragModeData} emptyText="暂无检索记录" color="#0f8f83" />
+      </div>
+    </div>
+  )
 }
 
-export default function MetricsPanel({ runs, logs }: { runs: AgentRunSnapshot[]; logs: AuditLogEntry[] }) {
-  const finishedRuns = runs.filter((run) => ['completed', 'blocked', 'failed', 'cancelled'].includes(run.status))
-  const completedRuns = finishedRuns.filter((run) => run.status === 'completed')
-  const toolLogs = logs.filter((log) => log.category === 'tool' || log.action.includes('tool'))
-  const durations = logs.map((log) => log.durationMs).filter((value): value is number => typeof value === 'number')
-  const modelLogs = logs.filter((log) => log.action === 'chat.stream' || log.action === 'chat.complete')
-  const firstTokenDurations = modelLogs.map((log) => Number(log.metadata.firstTokenMs)).filter(Number.isFinite)
-  const totalTokens = modelLogs.reduce((sum, log) => sum + (Number(log.metadata.totalTokens) || 0), 0)
-  const estimatedTokenRuns = modelLogs.filter((log) => log.metadata.tokenCountEstimated === true).length
-  const averageTurns = finishedRuns.length === 0 ? null : finishedRuns.reduce((sum, run) => sum + run.turns, 0) / finishedRuns.length
-  const failureCounts = logs.filter((log) => log.status === 'failure').reduce<Record<string, number>>((counts, log) => {
-    counts[log.category] = (counts[log.category] ?? 0) + 1
-    return counts
-  }, {})
-  const ragModes = logs.filter((log) => log.action === 'knowledge.search').reduce<Record<string, number>>((counts, log) => {
-    const mode = String(log.metadata.mode ?? 'unknown')
-    counts[mode] = (counts[mode] ?? 0) + 1
-    return counts
-  }, {})
-
-  return <div className="insight-section">
-    <h3>Agent 指标面板</h3>
-    <p>所有统计都来自本机 SQLite 运行记录与审计日志，不包含模拟分数。</p>
-    <div className="data-stat-grid">
-      <span><strong>{percent(completedRuns.length, finishedRuns.length)}</strong><small>任务完成率</small></span>
-      <span><strong>{percent(toolLogs.filter((log) => log.status === 'success').length, toolLogs.length)}</strong><small>Tool 成功率</small></span>
-      <span><strong>{averageTurns === null ? '暂无数据' : averageTurns.toFixed(1)}</strong><small>平均执行轮数</small></span>
-      <span><strong>{durations.length}</strong><small>有耗时记录的事件</small></span>
-      <span><strong>{percentile(durations, 0.5) === null ? '暂无数据' : `${percentile(durations, 0.5)} ms`}</strong><small>P50 响应时间</small></span>
-      <span><strong>{percentile(durations, 0.95) === null ? '暂无数据' : `${percentile(durations, 0.95)} ms`}</strong><small>P95 响应时间</small></span>
-      <span><strong>{percentile(firstTokenDurations, 0.5) === null ? '暂无数据' : `${percentile(firstTokenDurations, 0.5)} ms`}</strong><small>首字延迟 P50</small></span>
-      <span><strong>{totalTokens || '暂无数据'}</strong><small>累计 Token{estimatedTokenRuns > 0 ? `（${estimatedTokenRuns} 次估算）` : ''}</small></span>
-    </div>
-    <div className="report-card">
-      <strong>失败原因分布</strong>
-      <p>{Object.keys(failureCounts).length === 0 ? '暂无失败记录' : Object.entries(failureCounts).map(([key, count]) => `${key}: ${count}`).join(' · ')}</p>
-    </div>
-    <div className="report-card">
-      <strong>RAG 检索模式</strong>
-      <p>{Object.keys(ragModes).length === 0 ? '暂无检索记录' : Object.entries(ragModes).map(([key, count]) => `${key}: ${count}`).join(' · ')}</p>
-    </div>
-  </div>
+function MetricChart({
+  title,
+  data,
+  emptyText,
+  color,
+}: {
+  title: string
+  data: Array<{ name: string; value: number }>
+  emptyText: string
+  color: string
+}) {
+  return (
+    <section className="metric-chart">
+      <h4>{title}</h4>
+      {data.length === 0 ? (
+        <p className="empty-state">{emptyText}</p>
+      ) : (
+        <div className="metric-chart-canvas">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={data} margin={{ top: 6, right: 8, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#dce5e3" />
+              <XAxis dataKey="name" tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis allowDecimals={false} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+              <Tooltip cursor={{ fill: '#eef5f3' }} />
+              <Bar dataKey="value" fill={color} radius={[4, 4, 0, 0]} maxBarSize={40} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </section>
+  )
 }
