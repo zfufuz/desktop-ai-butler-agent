@@ -10,6 +10,8 @@ import {
   FileText,
   ListChecks,
   Pause,
+  PanelLeftOpen,
+  PanelRightOpen,
   Pin,
   Plane,
   Play,
@@ -570,6 +572,7 @@ function App() {
   const [rightPanelWidth, setRightPanelWidth] = useState(() => Number(localStorage.getItem('ai-butler:rightPanelWidth')) || 340)
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() => localStorage.getItem('ai-butler:leftPanelCollapsed') === 'true')
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => localStorage.getItem('ai-butler:rightPanelCollapsed') === 'true')
+  const [compactDrawer, setCompactDrawer] = useState<'left' | 'right' | null>(null)
   const leftPanelRef = usePanelRef()
   const rightPanelRef = usePanelRef()
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null)
@@ -683,7 +686,7 @@ function App() {
       deleted: builtinToolOverrides[tool.name]?.deleted === true,
     }))
     .filter((tool) => !tool.deleted)
-  const inputRef = useRef<HTMLInputElement | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const agentAbortControllerRef = useRef<AbortController | null>(null)
   const agentPauseRequestedRef = useRef(false)
   const hasSyncedKnowledgeRef = useRef(false)
@@ -1995,6 +1998,28 @@ ${fileContext}`,
       panel.expand()
     } else {
       panel.collapse()
+    }
+  }
+
+  async function regenerateLastResponse() {
+    if (isThinking) return
+    const latestAssistantIndex = messages.findLastIndex((message) => message.role === 'assistant')
+    if (latestAssistantIndex < 0) return
+    const previousUser = messages
+      .slice(0, latestAssistantIndex)
+      .findLast((message) => message.role === 'user')
+    if (!previousUser) return
+
+    setMessages((currentMessages) => currentMessages.filter((_, index) => index !== latestAssistantIndex))
+    setAssistantStatus('thinking')
+    setAgentTimeline([])
+    try {
+      await executeAgentRequest(previousUser.content)
+    } catch {
+      await streamAssistantMessage('重新生成失败，请检查模型连接后再试。')
+    } finally {
+      agentAbortControllerRef.current = null
+      setAssistantStatus('idle')
     }
   }
 
@@ -3319,6 +3344,32 @@ ${result.content}
     )
   }
 
+  function renderWorkspaceTabs() {
+    return (
+      <nav className="workspace-tabs" aria-label="工作台视图">
+        <button className={['home', 'plans', 'schedule', 'reports', 'activity'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('home')}>任务</button>
+        <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>上下文</button>
+        <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
+      </nav>
+    )
+  }
+
+  function renderUserInspector() {
+    return (
+      <>
+        <div className="workspace-panel-heading">
+          <div>
+            <span className="eyebrow">Workspace</span>
+            <h2>工作台</h2>
+          </div>
+          <span className="workspace-summary">{todayPlans.length} 项待处理</span>
+        </div>
+        {renderWorkspaceTabs()}
+        {renderUserWorkspacePanel()}
+      </>
+    )
+  }
+
   return (
     <main
       className={`app-shell user-mode ${isDraggingFile ? 'dragging-file' : ''} ${leftPanelCollapsed ? 'left-panel-collapsed' : ''} ${rightPanelCollapsed ? 'right-panel-collapsed' : ''}`}
@@ -3341,6 +3392,7 @@ ${result.content}
       <Group className="workspace-panels" orientation="horizontal">
       <Panel
         id="assistant-profile"
+        className="left-panel-container"
         panelRef={leftPanelRef}
         defaultSize={leftPanelCollapsed ? 44 : leftPanelWidth}
         minSize={220}
@@ -3431,6 +3483,7 @@ ${result.content}
           onSaveResult={(content, createPlans) => {
             queueGeneratedReport(content, '对话', createPlans ? 'plans' : 'report')
           }}
+          onRegenerate={() => void regenerateLastResponse()}
         />
 
         {pendingReportCard && (
@@ -3528,6 +3581,7 @@ ${result.content}
           }))}
           onInputChange={setInput}
           onSend={sendMessage}
+          onStop={cancelAgentRun}
           onAddFiles={addFilesToComposer}
           onRemoveAttachment={removePendingAttachment}
         />
@@ -3541,6 +3595,7 @@ ${result.content}
 
       <Panel
         id="workspace-inspector"
+        className="right-panel-container"
         panelRef={rightPanelRef}
         defaultSize={rightPanelCollapsed ? 44 : rightPanelWidth}
         minSize={280}
@@ -3565,22 +3620,7 @@ ${result.content}
         {!rightPanelCollapsed && (
           <>
         {mode === 'user' ? (
-          <>
-            <div className="workspace-panel-heading">
-              <div>
-                <span className="eyebrow">Workspace</span>
-                <h2>工作台</h2>
-              </div>
-              <span className="workspace-summary">{todayPlans.length} 项待处理</span>
-            </div>
-            <nav className="workspace-tabs" aria-label="工作台视图">
-              <button className={workspacePage === 'home' ? 'active' : ''} onClick={() => setWorkspacePage('home')}>概览</button>
-              <button className={workspacePage === 'plans' || workspacePage === 'schedule' ? 'active' : ''} onClick={() => setWorkspacePage('plans')}>任务</button>
-              <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>资料</button>
-              <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
-            </nav>
-            {renderUserWorkspacePanel()}
-          </>
+          renderUserInspector()
         ) : (
           <>
             <h2>开发者控制台</h2>
@@ -3695,6 +3735,44 @@ ${result.content}
       </aside>
       </Panel>
       </Group>
+
+      <div className="compact-edge-actions" aria-label="紧凑窗口面板">
+        <button onClick={() => setCompactDrawer('left')} title="打开主导航">
+          <PanelLeftOpen aria-hidden="true" size={18} />
+        </button>
+        <button onClick={() => setCompactDrawer('right')} title="打开工作台">
+          <PanelRightOpen aria-hidden="true" size={18} />
+        </button>
+      </div>
+
+      {compactDrawer && (
+        <div className="compact-drawer-backdrop" onClick={() => setCompactDrawer(null)}>
+          <aside
+            className={`compact-drawer ${compactDrawer}`}
+            onClick={(event) => event.stopPropagation()}
+            aria-label={compactDrawer === 'left' ? '主导航' : '工作台'}
+          >
+            <button className="compact-drawer-close" onClick={() => setCompactDrawer(null)} title="关闭面板">
+              <X aria-hidden="true" size={17} />
+            </button>
+            {compactDrawer === 'left' ? (
+              <AvatarPanel
+                appName={appName}
+                appVersion={appVersion}
+                systemInfoText={systemInfoText}
+                statusText={getAssistantStatusText(assistantStatus)}
+                activePage={workspacePage}
+                onNavigate={(page) => {
+                  setWorkspacePage(page)
+                  setCompactDrawer(null)
+                }}
+              />
+            ) : (
+              <div className="compact-workspace-content">{renderUserInspector()}</div>
+            )}
+          </aside>
+        </div>
+      )}
 
       {tripPlannerOpen && (
         <div className="settings-overlay trip-planner-overlay" role="presentation">

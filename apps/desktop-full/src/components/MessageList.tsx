@@ -8,6 +8,7 @@ import {
   CircleX,
   Copy,
   LoaderCircle,
+  RotateCcw,
   Save,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
@@ -21,6 +22,7 @@ type MessageListProps = {
   timeline?: AgentTimelineStep[]
   isExecuting?: boolean
   onSaveResult?: (content: string, createPlans: boolean) => void
+  onRegenerate?: () => void
 }
 
 function formatMessageTime(timestamp: number): string {
@@ -35,6 +37,7 @@ function MessageList({
   timeline = [],
   isExecuting = false,
   onSaveResult,
+  onRegenerate,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement | null>(null)
   const shouldFollowOutputRef = useRef(true)
@@ -109,6 +112,18 @@ function MessageList({
             >
               {copiedMessageId === message.id ? <Check size={14} /> : <Copy size={14} />}
             </button>
+            {message.id === latestAssistantId && onRegenerate && !isExecuting && (
+              <div className="message-footer-actions">
+                <button onClick={() => void copyMessage(message)}>
+                  {copiedMessageId === message.id ? <Check size={14} /> : <Copy size={14} />}
+                  {copiedMessageId === message.id ? '已复制' : '复制'}
+                </button>
+                <button onClick={onRegenerate}>
+                  <RotateCcw size={14} />
+                  重新生成
+                </button>
+              </div>
+            )}
           </article>
           </div>
         ))}
@@ -182,6 +197,27 @@ function ExecutionCard({
 }) {
   const orderedSteps = [...timeline].reverse()
   const failedCount = orderedSteps.filter((step) => step.status === 'error').length
+  const toolCallCount = orderedSteps.filter((step) => step.title === '调用工具').length
+  const elapsedMs = Math.max(
+    0,
+    (isExecuting ? Date.now() : orderedSteps.at(-1)?.createdAt ?? Date.now()) -
+      (orderedSteps[0]?.createdAt ?? Date.now()),
+  )
+  const phaseDefinitions = [
+    { label: '理解目标', matches: ['接收目标'] },
+    { label: '制定计划', matches: ['规划任务', '选择下一步'] },
+    { label: '调用工具', matches: ['调用工具', '观察结果'] },
+    { label: '整理结果', matches: ['整理结果'] },
+  ]
+  const phases = phaseDefinitions.map((phase) => {
+    const matchedSteps = orderedSteps.filter((step) => phase.matches.includes(step.title))
+    const hasError = matchedSteps.some((step) => step.status === 'error')
+    const done = matchedSteps.length > 0
+    const active = isExecuting && !done && phase.label === (
+      toolCallCount > 0 ? '整理结果' : orderedSteps.some((step) => step.title === '选择下一步') ? '调用工具' : '制定计划'
+    )
+    return { ...phase, status: hasError ? 'error' : done ? 'success' : active ? 'running' : 'pending' }
+  })
 
   return (
     <details className={`execution-card ${failedCount > 0 ? 'has-error' : ''}`}>
@@ -191,7 +227,10 @@ function ExecutionCard({
         </span>
         <span>
           <strong>{isExecuting ? 'Agent 正在执行' : failedCount > 0 ? '执行完成，存在失败步骤' : 'Agent 执行完成'}</strong>
-          <small>{orderedSteps.length} 个步骤{failedCount > 0 ? ` · ${failedCount} 个失败` : ''}</small>
+          <small>
+            {toolCallCount} 次工具调用 · {(elapsedMs / 1000).toFixed(1)} 秒
+            {failedCount > 0 ? ` · ${failedCount} 个失败` : ''}
+          </small>
         </span>
         <span className="execution-expand">
           <span className="collapsed-label">查看过程</span>
@@ -199,6 +238,17 @@ function ExecutionCard({
         </span>
       </summary>
       <div className="execution-step-list">
+        <div className="execution-phase-grid" aria-label="Agent 执行阶段">
+          {phases.map((phase, index) => (
+            <div className={`execution-phase ${phase.status}`} key={phase.label}>
+              <span>{index + 1}</span>
+              <strong>{phase.label}</strong>
+              <small>
+                {phase.status === 'success' ? '完成' : phase.status === 'error' ? '失败' : phase.status === 'running' ? '进行中' : '等待'}
+              </small>
+            </div>
+          ))}
+        </div>
         {orderedSteps.map((step, index) => (
           <div className={`execution-step ${step.status}`} key={step.id}>
             <span className="execution-step-index">{index + 1}</span>
