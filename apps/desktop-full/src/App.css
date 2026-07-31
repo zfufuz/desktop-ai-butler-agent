@@ -576,6 +576,19 @@ button:hover:not(:disabled) {
   height: 100%;
 }
 
+.message-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.message-row.user {
+  align-items: flex-end;
+}
+
 .trip-result-card {
   margin: 0 26px 12px;
   border: 1px solid rgba(20, 184, 166, 0.34);
@@ -725,6 +738,201 @@ button:hover:not(:disabled) {
   border-radius: 8px;
   line-height: 1.65;
   box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+}
+
+.message-row .message {
+  align-self: auto;
+}
+
+.structured-answer {
+  display: grid;
+  gap: 0;
+}
+
+.answer-section {
+  min-width: 0;
+  padding: 12px 0 4px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.answer-section:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.answer-section.summary {
+  margin: 0 0 8px;
+  border: 0;
+  border-left: 3px solid #14b8a6;
+  border-radius: 6px;
+  background: #f0fdfa;
+  padding: 10px 12px;
+}
+
+.answer-section h3 {
+  margin: 0 0 7px;
+  color: #0f172a;
+  font-size: 12px;
+  letter-spacing: 0;
+}
+
+.answer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.answer-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  border: 1px solid rgba(15, 118, 110, 0.25);
+  border-radius: 7px;
+  background: #ffffff;
+  padding: 7px 10px;
+  color: #0f766e;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.answer-actions button.primary {
+  border-color: #0f766e;
+  background: #0f766e;
+  color: #ffffff;
+}
+
+.execution-card {
+  width: min(860px, 86%);
+  overflow: hidden;
+  border: 1px solid rgba(15, 118, 110, 0.2);
+  border-radius: 8px;
+  background: rgba(240, 253, 250, 0.78);
+}
+
+.execution-card.has-error {
+  border-color: rgba(220, 38, 38, 0.22);
+  background: rgba(254, 242, 242, 0.82);
+}
+
+.execution-card summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 46px;
+  padding: 8px 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.execution-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.execution-card summary > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+}
+
+.execution-card summary strong {
+  overflow: hidden;
+  color: #0f172a;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.execution-card summary small,
+.execution-step small {
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.execution-status-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 7px;
+  background: #ccfbf1;
+  color: #0f766e;
+}
+
+.execution-card.has-error .execution-status-icon {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.execution-expand {
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.execution-expand .expanded-label,
+.execution-card[open] .execution-expand .collapsed-label {
+  display: none;
+}
+
+.execution-card[open] .execution-expand .expanded-label {
+  display: inline;
+}
+
+.execution-step-list {
+  display: grid;
+  gap: 0;
+  max-height: 260px;
+  overflow: auto;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+  background: #ffffff;
+  padding: 4px 11px 8px;
+}
+
+.execution-step {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.execution-step:last-child {
+  border-bottom: 0;
+}
+
+.execution-step > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.execution-step strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.execution-step-index {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 6px;
+  background: #ecfdf5;
+  color: #0f766e;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.execution-step.error .execution-step-index {
+  background: #fee2e2;
+  color: #b91c1c;
 }
 
 .message-meta {

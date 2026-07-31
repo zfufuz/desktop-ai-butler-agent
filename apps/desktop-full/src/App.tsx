@@ -207,6 +207,7 @@ type PendingReportCard = {
   content: string
   source: string
   planCount: number
+  preferredAction?: 'report' | 'plans'
 }
 
 type BuiltinOverride = {
@@ -1019,13 +1020,18 @@ function App() {
       : null
   }
 
-  function queueGeneratedReport(content: string, source: string) {
+  function queueGeneratedReport(
+    content: string,
+    source: string,
+    preferredAction: PendingReportCard['preferredAction'] = 'report',
+  ) {
     setPendingReportCard({
       title: source.includes('文件夹') ? '资料夹分析报告' : `${source} 分析报告`,
       summary: createReportSummary(content),
       content,
       source,
       planCount: Math.min(extractPlanDraftsFromReport(content).length, 3),
+      preferredAction,
     })
   }
 
@@ -1484,7 +1490,12 @@ ${sanitizeTripAdvice(reply.content)}`
   async function executeAgentRequest(text: string, resumeFrom?: AgentRun) {
     // 将记忆、知识库和启用工具组装成一次可暂停、可恢复的 Agent 运行。
     const enabledCustomTools = platformConfig?.customTools.filter((tool) => tool.enabled !== false) ?? []
-    const modeHint = '请优先用通俗表达帮助用户整理资料、分析文件、生成报告和可执行计划。'
+    const modeHint = `请用通俗、简洁的表达完成任务。最终回复优先使用以下 Markdown 结构，只保留有内容的部分：
+## 结论
+## 关键发现
+## 来源
+## 下一步
+结论放在第一部分；无法确认的信息要明确说明；Tool 执行过程由界面单独展示，不要在正文复述内部步骤。`
     const memoryContext = memoryNotes.length > 0
       ? `\n\n用户长期记忆：\n${memoryNotes.map((note) => note.text).join('\n')}`
       : ''
@@ -3413,14 +3424,25 @@ ${result.content}
           </button>
         </section>
 
-        <MessageList messages={messages} />
+        <MessageList
+          messages={messages}
+          timeline={agentTimeline}
+          isExecuting={isThinking}
+          onSaveResult={(content, createPlans) => {
+            queueGeneratedReport(content, '对话', createPlans ? 'plans' : 'report')
+          }}
+        />
 
         {pendingReportCard && (
           <section className="trip-result-card" aria-label="分析结果保存选项">
             <div className="trip-result-heading">
               <div>
                 <strong>{pendingReportCard.title}</strong>
-                <span>分析已完成，保存前由你确认</span>
+                <span>
+                  {pendingReportCard.preferredAction === 'plans'
+                    ? `已识别 ${pendingReportCard.planCount} 条可执行计划，确认后写入任务系统`
+                    : '结论已整理完成，确认后保存到报告中心'}
+                </span>
               </div>
               <button className="icon-button" title="关闭结果卡" onClick={() => setPendingReportCard(null)}>
                 <X size={16} />
@@ -3432,8 +3454,16 @@ ${result.content}
             </div>
             <div className="trip-result-actions">
               <button onClick={() => void downloadGeneratedReport()}><Download size={16} />下载报告</button>
-              <button onClick={() => void confirmGeneratedReport(false)}><FileText size={16} />仅保存报告</button>
-              <button className="primary" onClick={() => void confirmGeneratedReport(true)}>
+              <button
+                className={pendingReportCard.preferredAction === 'report' ? 'primary' : undefined}
+                onClick={() => void confirmGeneratedReport(false)}
+              >
+                <FileText size={16} />仅保存报告
+              </button>
+              <button
+                className={pendingReportCard.preferredAction === 'plans' ? 'primary' : undefined}
+                onClick={() => void confirmGeneratedReport(true)}
+              >
                 <CalendarPlus size={16} />保存并加入计划
               </button>
             </div>

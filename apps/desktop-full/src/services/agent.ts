@@ -382,11 +382,12 @@ async function executeTool(
 }
 
 function emitTimeline(event: AgentRuntimeEvent, onTimeline: TimelineLogger) {
-  if (event.type === 'turn') onTimeline(createTimelineStep('Agent 思考', event.detail, 'success'))
-  if (event.type === 'decision') onTimeline(createTimelineStep('模型决策', event.detail, 'success'))
-  if (event.type === 'tool-start') onTimeline(createTimelineStep('调用工具', `${event.call.name}${event.call.reason ? `：${event.call.reason}` : ''}`, 'success'))
+  // Timeline 只记录可审计动作，不把模型的内部推理过程暴露到界面。
+  if (event.type === 'turn') onTimeline(createTimelineStep('规划任务', event.detail, 'success'))
+  if (event.type === 'decision') onTimeline(createTimelineStep('选择下一步', '已根据当前结果更新执行计划', 'success'))
+  if (event.type === 'tool-start') onTimeline(createTimelineStep('调用工具', event.call.name, 'success'))
   if (event.type === 'tool-finish') onTimeline(createTimelineStep('观察结果', event.observation.summary, event.observation.ok ? 'success' : 'error'))
-  if (event.type === 'complete') onTimeline(createTimelineStep('Agent 完成', event.detail, 'success'))
+  if (event.type === 'complete') onTimeline(createTimelineStep('整理结果', '已根据真实工具结果生成答复', 'success'))
   if (event.type === 'paused') onTimeline(createTimelineStep('Agent 已暂停', event.detail, 'success'))
   if (event.type === 'cancelled') onTimeline(createTimelineStep('Agent 已取消', event.detail, 'error'))
 }
@@ -424,7 +425,15 @@ export async function runAgent(
     synthesize: async ({ observations }) => {
       const prompt = observations.length === 0
         ? `运行上下文（不是用户问题）：\n${options.context || '无'}\n\n用户问题：\n${userText}`
-        : `运行上下文（不是用户问题）：\n${options.context || '无'}\n\n用户目标：${userText}\n\n以下是 Agent 已执行工具得到的真实观察。请基于观察给出最终回复，明确结论、下一步和仍缺少的信息；不要声称执行过未出现的工具。\n\n${observations
+        : `运行上下文（不是用户问题）：\n${options.context || '无'}\n\n用户目标：${userText}\n\n以下是 Agent 已执行工具得到的真实观察。请基于观察给出最终回复，不得编造未出现的工具或结果。
+
+使用以下 Markdown 结构，只保留有内容的部分：
+## 结论
+## 关键发现
+## 来源
+## 下一步
+
+Tool 调用过程由界面单独展示，不要在正文复述内部步骤。\n\n${observations
             .map((item) => `## ${item.toolName}（${item.ok ? '成功' : '失败'}）\n${item.content}`)
             .join('\n\n')}`
       return options.onAssistantDelta
