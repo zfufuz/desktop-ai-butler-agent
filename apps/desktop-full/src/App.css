@@ -1320,6 +1320,10 @@ button:hover:not(:disabled) {
 }
 
 @media (max-width: 900px) {
+  .chat-panel {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+
   .left-panel-container,
   .right-panel-container,
   .left-resize,

@@ -32,7 +32,9 @@ function ChatInput({
     const textarea = inputRef.current
     if (!textarea) return
     textarea.style.height = 'auto'
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 156)}px`
+    const nextHeight = Math.min(textarea.scrollHeight, 156)
+    textarea.style.height = `${nextHeight}px`
+    textarea.style.overflowY = textarea.scrollHeight > 156 ? 'auto' : 'hidden'
   }, [input, inputRef])
 
   return (
