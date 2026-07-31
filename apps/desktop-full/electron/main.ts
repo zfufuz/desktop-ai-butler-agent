@@ -721,6 +721,11 @@ function initializeDatabase() {
   for (const [column, migration] of planMigrations) {
     if (!planColumns.has(column)) database.exec(migration)
   }
+  const recoveryTime = Date.now()
+  database.prepare(`UPDATE scheduled_agent_jobs
+    SET status = 'failed', last_result = '应用在任务执行期间退出，已恢复为待重试状态',
+        next_run_at = ?, updated_at = ?
+    WHERE status = 'running'`).run(recoveryTime, recoveryTime)
   const memoryColumns = new Set(
     (database.prepare('PRAGMA table_info(memory_notes)').all() as Array<{ name: string }>).map((column) => column.name),
   )
