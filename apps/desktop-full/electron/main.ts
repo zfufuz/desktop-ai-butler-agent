@@ -13,6 +13,7 @@ import { readXlsxFile } from './excel-parser.js'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
 import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
 import { BackendService, type BackendEmbeddingConfig, type BackendModelProvider, type BackendRerankerConfig } from './backend-service.js'
+import { calculateNextAutomationRun, type AutomationSchedule } from './automation-utils.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -136,6 +137,23 @@ type ScheduleEvent = {
   status: 'active' | 'done'
   recurrence: 'none' | 'daily' | 'weekly'
   nextAction?: string
+  createdAt: number
+  updatedAt: number
+}
+
+type ScheduledAgentJob = {
+  id: string
+  title: string
+  prompt: string
+  schedule: AutomationSchedule
+  time: string
+  runDate?: string
+  weekday?: number
+  enabled: boolean
+  status: 'idle' | 'running' | 'completed' | 'failed'
+  nextRunAt?: number
+  lastRunAt?: number
+  lastResult?: string
   createdAt: number
   updatedAt: number
 }
@@ -596,6 +614,22 @@ function initializeDatabase() {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS scheduled_agent_jobs (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      schedule TEXT NOT NULL,
+      run_time TEXT NOT NULL,
+      run_date TEXT,
+      weekday INTEGER,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'idle',
+      next_run_at INTEGER,
+      last_run_at INTEGER,
+      last_result TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS memory_notes (
       id TEXT PRIMARY KEY,
       text TEXT NOT NULL,
@@ -653,6 +687,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_activities_created_at ON activities(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_schedule_events_date ON schedule_events(event_date, start_time);
     CREATE INDEX IF NOT EXISTS idx_schedule_events_plan_id ON schedule_events(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_agent_jobs_due ON scheduled_agent_jobs(enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_memory_notes_created_at ON memory_notes(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at ON agent_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
@@ -1107,6 +1142,120 @@ function deleteScheduleEvent(eventId: string) {
     metadata: { eventId, deleted: Number(result.changes) },
   })
   return { deleted: Number(result.changes) > 0, id: String(eventId) }
+}
+
+function readScheduledAgentJobs(): ScheduledAgentJob[] {
+  type JobRow = Omit<ScheduledAgentJob, 'runDate' | 'weekday' | 'enabled' | 'nextRunAt' | 'lastRunAt' | 'lastResult'> & {
+    runDate: string | null
+    weekday: number | null
+    enabled: number
+    nextRunAt: number | null
+    lastRunAt: number | null
+    lastResult: string | null
+  }
+  const rows = initializeDatabase().prepare(`SELECT id, title, prompt, schedule, run_time AS time,
+      run_date AS runDate, weekday, enabled, status, next_run_at AS nextRunAt,
+      last_run_at AS lastRunAt, last_result AS lastResult,
+      created_at AS createdAt, updated_at AS updatedAt
+    FROM scheduled_agent_jobs ORDER BY enabled DESC, next_run_at, updated_at DESC`).all() as JobRow[]
+  return rows.map((row) => ({
+    ...row,
+    schedule: ['once', 'daily', 'weekly'].includes(row.schedule) ? row.schedule : 'daily',
+    enabled: Boolean(row.enabled),
+    runDate: row.runDate ?? undefined,
+    weekday: row.weekday ?? undefined,
+    nextRunAt: row.nextRunAt ?? undefined,
+    lastRunAt: row.lastRunAt ?? undefined,
+    lastResult: row.lastResult ?? undefined,
+  }))
+}
+
+function saveScheduledAgentJob(value: unknown) {
+  if (!value || typeof value !== 'object') throw new Error('自动任务参数无效')
+  const input = value as Partial<ScheduledAgentJob>
+  const existing = input.id ? readScheduledAgentJobs().find((job) => job.id === input.id) : undefined
+  const title = typeof input.title === 'string' ? input.title.trim().slice(0, 120) : existing?.title
+  const prompt = typeof input.prompt === 'string' ? input.prompt.trim().slice(0, 8000) : existing?.prompt
+  const schedule = input.schedule && ['once', 'daily', 'weekly'].includes(input.schedule)
+    ? input.schedule
+    : existing?.schedule ?? 'daily'
+  const time = typeof input.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input.time)
+    ? input.time
+    : existing?.time ?? '09:00'
+  const runDate = typeof input.runDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(input.runDate)
+    ? input.runDate
+    : existing?.runDate
+  const weekday = schedule === 'weekly'
+    ? Math.max(0, Math.min(6, Number(input.weekday ?? existing?.weekday ?? 1)))
+    : undefined
+  if (!title || !prompt || (schedule === 'once' && !runDate)) throw new Error('请填写任务名称、任务要求和有效执行时间')
+  const now = Date.now()
+  const enabled = typeof input.enabled === 'boolean' ? input.enabled : existing?.enabled ?? true
+  const nextRunAt = enabled
+    ? calculateNextAutomationRun({ schedule, time, runDate, weekday }, new Date(now - 1000))
+    : undefined
+  const job: ScheduledAgentJob = {
+    id: existing?.id ?? createId('automation'),
+    title,
+    prompt,
+    schedule,
+    time,
+    runDate,
+    weekday,
+    enabled: enabled && nextRunAt !== undefined,
+    status: existing?.status === 'running' ? 'running' : 'idle',
+    nextRunAt,
+    lastRunAt: existing?.lastRunAt,
+    lastResult: existing?.lastResult,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  }
+  initializeDatabase().prepare(`INSERT OR REPLACE INTO scheduled_agent_jobs
+    (id, title, prompt, schedule, run_time, run_date, weekday, enabled, status,
+     next_run_at, last_run_at, last_result, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      job.id, job.title, job.prompt, job.schedule, job.time, job.runDate ?? null,
+      job.weekday ?? null, job.enabled ? 1 : 0, job.status, job.nextRunAt ?? null,
+      job.lastRunAt ?? null, job.lastResult ?? null, job.createdAt, job.updatedAt,
+    )
+  writeAuditLog({ category: 'workflow', action: existing ? 'automation.update' : 'automation.create', summary: `${existing ? '已更新' : '已创建'}自动任务：${job.title}`, metadata: { jobId: job.id, schedule: job.schedule, nextRunAt: job.nextRunAt } })
+  return job
+}
+
+function claimScheduledAgentJob(jobId?: string) {
+  const now = Date.now()
+  const candidate = jobId
+    ? readScheduledAgentJobs().find((job) => job.id === jobId && job.status !== 'running')
+    : readScheduledAgentJobs().find((job) => job.enabled && job.status !== 'running' && Boolean(job.nextRunAt && job.nextRunAt <= now))
+  if (!candidate) return null
+  initializeDatabase().prepare(`UPDATE scheduled_agent_jobs
+    SET status = 'running', last_run_at = ?, updated_at = ? WHERE id = ? AND status != 'running'`)
+    .run(now, now, candidate.id)
+  writeAuditLog({ category: 'agent', action: 'automation.start', summary: `自动任务开始执行：${candidate.title}`, status: 'pending', metadata: { jobId: candidate.id } })
+  return { ...candidate, status: 'running' as const, lastRunAt: now, updatedAt: now }
+}
+
+function completeScheduledAgentJob(jobId: string, success: boolean, result = '') {
+  const job = readScheduledAgentJobs().find((item) => item.id === jobId)
+  if (!job) throw new Error('自动任务不存在')
+  const now = Date.now()
+  const nextRunAt = job.schedule === 'once'
+    ? undefined
+    : calculateNextAutomationRun(job, new Date(now))
+  initializeDatabase().prepare(`UPDATE scheduled_agent_jobs
+    SET enabled = ?, status = ?, next_run_at = ?, last_result = ?, updated_at = ? WHERE id = ?`).run(
+      job.schedule === 'once' ? 0 : job.enabled ? 1 : 0,
+      success ? 'completed' : 'failed', nextRunAt ?? null, result.slice(0, 2000) || null, now, job.id,
+    )
+  writeAuditLog({ level: success ? 'info' : 'error', category: 'agent', action: 'automation.complete', summary: `自动任务${success ? '执行完成' : '执行失败'}：${job.title}`, detail: result, status: success ? 'success' : 'failure', metadata: { jobId: job.id, nextRunAt } })
+  return readScheduledAgentJobs().find((item) => item.id === job.id)
+}
+
+function deleteScheduledAgentJob(jobId: string) {
+  const job = readScheduledAgentJobs().find((item) => item.id === jobId)
+  const result = initializeDatabase().prepare('DELETE FROM scheduled_agent_jobs WHERE id = ?').run(jobId)
+  writeAuditLog({ category: 'workflow', action: 'automation.delete', summary: `已删除自动任务：${job?.title ?? jobId}`, metadata: { jobId } })
+  return { deleted: Number(result.changes) > 0, id: jobId }
 }
 
 function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
@@ -2782,6 +2931,15 @@ ipcMain.handle('schedule:save', (_event, scheduleEvent: unknown) => {
 ipcMain.handle('schedule:delete', (_event, eventId: string) => {
   return deleteScheduleEvent(eventId)
 })
+
+ipcMain.handle('automation:list', () => readScheduledAgentJobs())
+ipcMain.handle('automation:save', (_event, job: unknown) => saveScheduledAgentJob(job))
+ipcMain.handle('automation:delete', (_event, jobId: string) => deleteScheduledAgentJob(String(jobId)))
+ipcMain.handle('automation:claim-due', () => claimScheduledAgentJob())
+ipcMain.handle('automation:claim-now', (_event, jobId: string) => claimScheduledAgentJob(String(jobId)))
+ipcMain.handle('automation:complete', (_event, jobId: string, success: boolean, result?: string) =>
+  completeScheduledAgentJob(String(jobId), Boolean(success), typeof result === 'string' ? result : ''),
+)
 
 ipcMain.handle('agent-runs:list', () => {
   return readAgentRuns()

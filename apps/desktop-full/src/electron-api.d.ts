@@ -1,4 +1,5 @@
 // React 渲染层的 Electron API 类型契约，必须与 preload 暴露的方法保持一致。
+import type { ScheduledAgentJob, ScheduledAgentJobDraft } from './automation/types'
 export {}
 
 type SystemInfo = {
@@ -308,6 +309,12 @@ declare global {
       getScheduleEvents: (startDate?: string, endDate?: string) => Promise<ScheduleEvent[]>
       saveScheduleEvent: (scheduleEvent: Partial<ScheduleEvent> & Pick<ScheduleEvent, 'title' | 'date' | 'start' | 'end'>) => Promise<ScheduleEvent>
       deleteScheduleEvent: (eventId: string) => Promise<{ deleted: boolean; id: string }>
+      getScheduledAgentJobs: () => Promise<ScheduledAgentJob[]>
+      saveScheduledAgentJob: (job: ScheduledAgentJobDraft | ScheduledAgentJob) => Promise<ScheduledAgentJob>
+      deleteScheduledAgentJob: (jobId: string) => Promise<{ deleted: boolean; id: string }>
+      claimDueScheduledAgentJob: () => Promise<ScheduledAgentJob | null>
+      claimScheduledAgentJobNow: (jobId: string) => Promise<ScheduledAgentJob | null>
+      completeScheduledAgentJob: (jobId: string, success: boolean, result?: string) => Promise<ScheduledAgentJob | undefined>
       checkinPlan: (planId: string, note: string, progress?: number) => Promise<ButlerWorkspaceData>
       addActivity: (text: string) => Promise<ButlerWorkspaceData>
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>

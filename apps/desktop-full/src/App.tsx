@@ -1,6 +1,6 @@
 ﻿import { useEffect, useRef, useState } from 'react'
 // 主应用工作台：协调聊天、文件、出差、报告、计划、设置和 Agent 可观测状态。
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffectEvent } from 'react'
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels'
 import {
   ChevronLeft,
@@ -23,6 +23,7 @@ import {
 } from 'lucide-react'
 import './App.css'
 import AvatarPanel from './components/AvatarPanel'
+import { AutomationPanel } from './components/AutomationPanel'
 import AgentRunsPanel, { type AgentRunSnapshot } from './components/AgentRunsPanel'
 import AuditLogPanel, {
   type AuditLogEntry,
@@ -48,6 +49,7 @@ import type { AgentRun } from './agent/protocol'
 import { wrapUntrustedCollection, wrapUntrustedContent } from './agent/security'
 import { getSkillDefinition, skillRegistry, type SkillId } from './skills/skillRegistry'
 import type { AssistantStatus, Message } from './type'
+import type { ScheduledAgentJob } from './automation/types'
 
 const MetricsPanel = lazy(() => import('./components/MetricsPanel'))
 
@@ -55,7 +57,7 @@ type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
 type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'activity' | 'memory'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'automations' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -545,6 +547,7 @@ function App() {
   const [knowledgeQuery, setKnowledgeQuery] = useState('')
   const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeSearchResult[]>([])
   const [agentRuns, setAgentRuns] = useState<AgentRunSnapshot[]>([])
+  const [scheduledJobs, setScheduledJobs] = useState<ScheduledAgentJob[]>([])
   const [pausedAgentRun, setPausedAgentRun] = useState<AgentRun | null>(null)
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([])
   const [auditLogsLoading, setAuditLogsLoading] = useState(false)
@@ -785,6 +788,7 @@ function App() {
 
       setAgentRuns(restoredRuns)
     })
+    window.electronAPI.getScheduledAgentJobs().then(setScheduledJobs)
     window.electronAPI.getAuditLogs({ limit: 100 }).then(setAuditLogs)
     window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
       const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
@@ -798,6 +802,62 @@ function App() {
 
     return () => window.clearInterval(backendStatusTimer)
   }, [isElectronReady])
+
+  async function refreshScheduledJobs() {
+    setScheduledJobs(await window.electronAPI.getScheduledAgentJobs())
+  }
+
+  async function runScheduledJob(job: ScheduledAgentJob) {
+    setAssistantStatus('thinking')
+    setAgentTimeline([])
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      { id: createMessageId(), role: 'user', content: `自动任务：${job.title}\n\n${job.prompt}`, createdAt: Date.now() },
+    ])
+    try {
+      await executeAgentRequest(job.prompt)
+      await window.electronAPI.completeScheduledAgentJob(job.id, true, 'Agent 已完成任务，详细过程见运行记录。')
+      await window.electronAPI.notify('自动任务已完成', job.title)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '未知错误'
+      await window.electronAPI.completeScheduledAgentJob(job.id, false, detail)
+      await window.electronAPI.notify('自动任务执行失败', `${job.title}：${detail}`)
+    } finally {
+      agentAbortControllerRef.current = null
+      setAssistantStatus('idle')
+      await refreshScheduledJobs()
+    }
+  }
+
+  async function runScheduledJobNow(jobId: string) {
+    if (isThinking) return
+    const job = await window.electronAPI.claimScheduledAgentJobNow(jobId)
+    if (job) await runScheduledJob(job)
+  }
+
+  const runScheduledJobEffect = useEffectEvent(runScheduledJob)
+
+  useEffect(() => {
+    if (!isElectronReady || isThinking) return
+    let active = true
+    let checking = false
+    const checkDueJob = async () => {
+      if (!active || checking) return
+      checking = true
+      try {
+        const job = await window.electronAPI.claimDueScheduledAgentJob()
+        if (active && job) await runScheduledJobEffect(job)
+      } finally {
+        checking = false
+      }
+    }
+    void checkDueJob()
+    const timer = window.setInterval(checkDueJob, 30_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [isElectronReady, isThinking])
 
   useEffect(() => {
     if (!isElectronReady || hasSyncedKnowledgeRef.current || knowledgeDocuments.length === 0) return
@@ -3007,6 +3067,16 @@ ${result.content}
       )
     }
 
+    if (workspacePage === 'automations') {
+      return (
+        <AutomationPanel
+          jobs={scheduledJobs}
+          onRefresh={refreshScheduledJobs}
+          onRunNow={runScheduledJobNow}
+        />
+      )
+    }
+
     if (workspacePage === 'eval') {
       return <EvalPanel />
     }
@@ -3317,6 +3387,9 @@ ${result.content}
         </div>
 
         <div className="workspace-action-list">
+          <button onClick={() => setWorkspacePage('automations')}>
+            <span><strong>自动任务</strong><small>定时运行 Agent 并通知结果</small></span><b>{scheduledJobs.filter((job) => job.enabled).length}</b>
+          </button>
           <button onClick={() => setWorkspacePage('schedule')}>
             <span><strong>时间规划</strong><small>日程、冲突检测与智能重排</small></span><b>日 / 周</b>
           </button>
@@ -3347,7 +3420,7 @@ ${result.content}
   function renderWorkspaceTabs() {
     return (
       <nav className="workspace-tabs" aria-label="工作台视图">
-        <button className={['home', 'plans', 'schedule', 'reports', 'activity'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('home')}>任务</button>
+        <button className={['home', 'plans', 'schedule', 'automations', 'reports', 'activity'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('home')}>任务</button>
         <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>上下文</button>
         <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
       </nav>
