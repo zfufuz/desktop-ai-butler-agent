@@ -36,6 +36,7 @@ import KnowledgePanel, {
   type KnowledgeSearchResult,
 } from './components/KnowledgePanel'
 import MessageList from './components/MessageList'
+import { McpSettingsPanel } from './components/McpSettingsPanel'
 import { SchedulePanel } from './components/SchedulePanel'
 import { createAssistantReply } from './services/assistant'
 import {
@@ -50,13 +51,14 @@ import { wrapUntrustedCollection, wrapUntrustedContent } from './agent/security'
 import { getSkillDefinition, skillRegistry, type SkillId } from './skills/skillRegistry'
 import type { AssistantStatus, Message } from './type'
 import type { ScheduledAgentJob } from './automation/types'
+import type { McpServerConfig } from './mcp/types'
 
 const MetricsPanel = lazy(() => import('./components/MetricsPanel'))
 
 type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
-type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'installed' | 'extensions' | 'advanced' | 'data'
+type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'mcp' | 'installed' | 'extensions' | 'advanced' | 'data'
 type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'automations' | 'activity' | 'memory'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
@@ -548,6 +550,7 @@ function App() {
   const [knowledgeResults, setKnowledgeResults] = useState<KnowledgeSearchResult[]>([])
   const [agentRuns, setAgentRuns] = useState<AgentRunSnapshot[]>([])
   const [scheduledJobs, setScheduledJobs] = useState<ScheduledAgentJob[]>([])
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([])
   const [pausedAgentRun, setPausedAgentRun] = useState<AgentRun | null>(null)
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([])
   const [auditLogsLoading, setAuditLogsLoading] = useState(false)
@@ -789,6 +792,7 @@ function App() {
       setAgentRuns(restoredRuns)
     })
     window.electronAPI.getScheduledAgentJobs().then(setScheduledJobs)
+    window.electronAPI.getMcpServers().then(setMcpServers)
     window.electronAPI.getAuditLogs({ limit: 100 }).then(setAuditLogs)
     window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
       const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
@@ -805,6 +809,10 @@ function App() {
 
   async function refreshScheduledJobs() {
     setScheduledJobs(await window.electronAPI.getScheduledAgentJobs())
+  }
+
+  async function refreshMcpServers() {
+    setMcpServers(await window.electronAPI.getMcpServers())
   }
 
   async function runScheduledJob(job: ScheduledAgentJob) {
@@ -1579,6 +1587,15 @@ ${sanitizeTripAdvice(reply.content)}`
           description: displayDescription,
         })),
       customTools: enabledCustomTools,
+      mcpTools: mcpServers
+        .filter((server) => server.enabled && server.status === 'connected')
+        .flatMap((server) => server.tools.map((tool) => ({
+          serverId: server.id,
+          serverName: server.name,
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        }))),
       context: `${modeHint}${memoryContext}`,
       onTimeline: addTimelineStep,
       requestPermission: requestToolPermission,
@@ -3970,6 +3987,10 @@ ${result.content}
                   <span><strong>添加 HTTP API Tool</strong><small>连接天气、路线或其他外部服务。</small></span>
                   <b>添加</b>
                 </button>
+                <button className="settings-entry" onClick={() => setSettingsPage('mcp')}>
+                  <span><strong>MCP Server</strong><small>连接本地 MCP 服务并把工具加入 Agent。</small></span>
+                  <b>{mcpServers.filter((server) => server.enabled).length} 个</b>
+                </button>
                 <button className="settings-entry" onClick={openExtensionsFolder}>
                   <span><strong>扩展文件夹</strong><small>放入扩展包后由系统自动读取。</small></span>
                   <b>打开</b>
@@ -4006,6 +4027,10 @@ ${result.content}
                   <b>日志</b>
                 </button>
               </div>
+            )}
+
+            {settingsPage === 'mcp' && (
+              <McpSettingsPanel servers={mcpServers} onRefresh={refreshMcpServers} />
             )}
 
             {settingsPage === 'provider' && platformConfig && (

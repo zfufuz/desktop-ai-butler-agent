@@ -14,6 +14,7 @@ import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, enco
 import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
 import { BackendService, type BackendEmbeddingConfig, type BackendModelProvider, type BackendRerankerConfig } from './backend-service.js'
 import { calculateNextAutomationRun, type AutomationSchedule } from './automation-utils.js'
+import { callMcpTool, discoverMcpTools } from './mcp-client.js'
 
 const DEV_SERVER_URL = 'http://localhost:5173'
 const APP_TITLE = '桌面 AI 管家'
@@ -154,6 +155,26 @@ type ScheduledAgentJob = {
   nextRunAt?: number
   lastRunAt?: number
   lastResult?: string
+  createdAt: number
+  updatedAt: number
+}
+
+type McpToolSummary = {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
+type McpServerConfig = {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  cwd?: string
+  enabled: boolean
+  tools: McpToolSummary[]
+  status: 'unknown' | 'connected' | 'error'
+  lastError?: string
   createdAt: number
   updatedAt: number
 }
@@ -627,6 +648,19 @@ function initializeDatabase() {
       next_run_at INTEGER,
       last_run_at INTEGER,
       last_result TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS mcp_servers (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      command TEXT NOT NULL,
+      args_json TEXT NOT NULL DEFAULT '[]',
+      cwd TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      tools_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'unknown',
+      last_error TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -1261,6 +1295,90 @@ function deleteScheduledAgentJob(jobId: string) {
   const result = initializeDatabase().prepare('DELETE FROM scheduled_agent_jobs WHERE id = ?').run(jobId)
   writeAuditLog({ category: 'workflow', action: 'automation.delete', summary: `已删除自动任务：${job?.title ?? jobId}`, metadata: { jobId } })
   return { deleted: Number(result.changes) > 0, id: jobId }
+}
+
+function readMcpServers(): McpServerConfig[] {
+  type McpRow = Omit<McpServerConfig, 'args' | 'cwd' | 'enabled' | 'tools' | 'lastError'> & {
+    argsJson: string
+    cwd: string | null
+    enabled: number
+    toolsJson: string
+    lastError: string | null
+  }
+  const rows = initializeDatabase().prepare(`SELECT id, name, command, args_json AS argsJson, cwd,
+    enabled, tools_json AS toolsJson, status, last_error AS lastError,
+    created_at AS createdAt, updated_at AS updatedAt FROM mcp_servers ORDER BY updated_at DESC`).all() as McpRow[]
+  return rows.map((row) => {
+    let args: string[] = []
+    let tools: McpToolSummary[] = []
+    try { args = JSON.parse(row.argsJson) } catch { args = [] }
+    try { tools = JSON.parse(row.toolsJson) } catch { tools = [] }
+    return { ...row, args, tools, enabled: Boolean(row.enabled), cwd: row.cwd ?? undefined, lastError: row.lastError ?? undefined }
+  })
+}
+
+function saveMcpServer(value: unknown) {
+  if (!value || typeof value !== 'object') throw new Error('MCP Server 参数无效')
+  const input = value as Partial<McpServerConfig>
+  const existing = input.id ? readMcpServers().find((server) => server.id === input.id) : undefined
+  const name = typeof input.name === 'string' ? input.name.trim().slice(0, 100) : existing?.name
+  const command = typeof input.command === 'string' ? input.command.trim().slice(0, 500) : existing?.command
+  if (!name || !command) throw new Error('MCP Server 需要名称和启动命令')
+  const args = Array.isArray(input.args) ? input.args.filter((item): item is string => typeof item === 'string').slice(0, 40) : existing?.args ?? []
+  const cwd = typeof input.cwd === 'string' ? input.cwd.trim().slice(0, 1000) || undefined : existing?.cwd
+  const now = Date.now()
+  const server: McpServerConfig = {
+    id: existing?.id ?? createId('mcp'), name, command, args, cwd,
+    enabled: typeof input.enabled === 'boolean' ? input.enabled : existing?.enabled ?? true,
+    tools: existing?.tools ?? [], status: existing?.status ?? 'unknown', lastError: existing?.lastError,
+    createdAt: existing?.createdAt ?? now, updatedAt: now,
+  }
+  initializeDatabase().prepare(`INSERT OR REPLACE INTO mcp_servers
+    (id, name, command, args_json, cwd, enabled, tools_json, status, last_error, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      server.id, server.name, server.command, JSON.stringify(server.args), server.cwd ?? null,
+      server.enabled ? 1 : 0, JSON.stringify(server.tools), server.status, server.lastError ?? null,
+      server.createdAt, server.updatedAt,
+    )
+  writeAuditLog({ category: 'security', action: existing ? 'mcp.update' : 'mcp.create', summary: `${existing ? '已更新' : '已添加'} MCP Server：${server.name}`, metadata: { serverId: server.id, command: server.command, argsCount: server.args.length } })
+  return server
+}
+
+async function refreshMcpServer(serverId: string) {
+  const server = readMcpServers().find((item) => item.id === serverId)
+  if (!server) throw new Error('MCP Server 不存在')
+  const startedAt = Date.now()
+  try {
+    const tools = await discoverMcpTools(server)
+    initializeDatabase().prepare(`UPDATE mcp_servers SET tools_json = ?, status = 'connected',
+      last_error = NULL, updated_at = ? WHERE id = ?`).run(JSON.stringify(tools), Date.now(), server.id)
+    writeAuditLog({ category: 'tool', action: 'mcp.discover', summary: `MCP 工具发现成功：${server.name}`, durationMs: Date.now() - startedAt, metadata: { serverId, tools: tools.map((tool) => tool.name) } })
+    return readMcpServers().find((item) => item.id === server.id)!
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    initializeDatabase().prepare(`UPDATE mcp_servers SET status = 'error', last_error = ?, updated_at = ? WHERE id = ?`).run(detail.slice(0, 2000), Date.now(), server.id)
+    writeAuditLog({ level: 'error', category: 'tool', action: 'mcp.discover', summary: `MCP Server 连接失败：${server.name}`, detail, status: 'failure', durationMs: Date.now() - startedAt, metadata: { serverId } })
+    throw new Error(`MCP 连接失败：${detail}`)
+  }
+}
+
+async function invokeMcpServerTool(serverId: string, toolName: string, input: unknown) {
+  const server = readMcpServers().find((item) => item.id === serverId && item.enabled)
+  if (!server) throw new Error('MCP Server 未启用或不存在')
+  if (!server.tools.some((tool) => tool.name === toolName)) throw new Error('MCP Tool 未注册，请先刷新工具列表')
+  const safeInput = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {}
+  const startedAt = Date.now()
+  const result = await callMcpTool(server, toolName, safeInput)
+  writeAuditLog({ level: result.isError ? 'error' : 'info', category: 'tool', action: 'mcp.invoke', summary: `MCP Tool ${result.isError ? '执行失败' : '执行成功'}：${server.name}/${toolName}`, detail: result.content, status: result.isError ? 'failure' : 'success', durationMs: Date.now() - startedAt, metadata: { serverId, toolName } })
+  if (result.isError) throw new Error(result.content || 'MCP Tool 返回错误')
+  return result
+}
+
+function deleteMcpServer(serverId: string) {
+  const server = readMcpServers().find((item) => item.id === serverId)
+  const result = initializeDatabase().prepare('DELETE FROM mcp_servers WHERE id = ?').run(serverId)
+  writeAuditLog({ category: 'security', action: 'mcp.delete', summary: `已删除 MCP Server：${server?.name ?? serverId}`, metadata: { serverId } })
+  return { deleted: Number(result.changes) > 0, id: serverId }
 }
 
 function normalizeKnowledgeDocument(value: unknown): KnowledgeDocumentInput {
@@ -2945,6 +3063,11 @@ ipcMain.handle('automation:claim-now', (_event, jobId: string) => claimScheduled
 ipcMain.handle('automation:complete', (_event, jobId: string, success: boolean, result?: string) =>
   completeScheduledAgentJob(String(jobId), Boolean(success), typeof result === 'string' ? result : ''),
 )
+ipcMain.handle('mcp:list', () => readMcpServers())
+ipcMain.handle('mcp:save', (_event, server: unknown) => saveMcpServer(server))
+ipcMain.handle('mcp:delete', (_event, serverId: string) => deleteMcpServer(String(serverId)))
+ipcMain.handle('mcp:discover', (_event, serverId: string) => refreshMcpServer(String(serverId)))
+ipcMain.handle('mcp:invoke', (_event, serverId: string, toolName: string, input: unknown) => invokeMcpServerTool(String(serverId), String(toolName), input))
 
 ipcMain.handle('agent-runs:list', () => {
   return readAgentRuns()

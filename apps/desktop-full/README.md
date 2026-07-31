@@ -206,7 +206,7 @@ Tool 示例：
 - SQLite checkpoint 与 Agent Eval 的批量执行器仍主要位于 TypeScript 侧，后续再迁入 Python；这不影响当前桌面工作流与工具调用。
 - 开发环境使用项目内 `backend/.venv`；Windows 安装包内嵌 Python sidecar 可执行文件的构建流程尚未启用，因此本次改动不会生成新的安装包。
 - XLSX 使用 SheetJS、DOCX 使用 Mammoth、文本型 PDF 使用 PDF.js 体系解析；PPTX 使用本地 XML 提取。扫描 PDF 与图片正文尚未接入 OCR。
-- 自定义 HTTP Tool 已支持结构化 Schema 和常见请求映射；OAuth2 与 MCP Server 仍需后续接入。
+- 自定义 HTTP Tool 已支持结构化 Schema 和常见请求映射；MCP 支持本地 stdio Server 的连接、工具发现和权限确认调用，OAuth2 仍需后续接入。
 - 当前动态立绘是状态驱动的桌面角色动画，不是 Live2D 模型；接入 Live2D 仍需要用户提供合法模型素材与运行时。
 - 暂停和取消在 Agent 的安全步骤边界生效，不能中断已经发出的单次模型网络请求。
 - RAG Eval 当前真实运行检索层；Tool 选择、权限恢复和计划复盘题保留在题库中，但不会展示未实际执行的成绩。

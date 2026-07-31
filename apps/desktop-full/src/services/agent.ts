@@ -52,6 +52,17 @@ type CustomAgentTool = {
   enabled?: boolean
 }
 
+export type McpAgentTool = {
+  serverId: string
+  serverName: string
+  name: string
+  description: string
+  inputSchema: {
+    properties?: Record<string, { type?: string; description?: string }>
+    required?: string[]
+  }
+}
+
 type ToolLogger = (log: ToolCallLog) => void
 type TimelineLogger = (step: AgentTimelineStep) => void
 type PermissionRequester = (toolName: string, reason: string) => Promise<boolean> | boolean
@@ -60,6 +71,7 @@ type AgentOptions = {
   knowledgeDocuments: KnowledgeDocument[]
   builtinTools?: AgentToolDefinition[]
   customTools?: CustomAgentTool[]
+  mcpTools?: McpAgentTool[]
   context?: string
   onTimeline: TimelineLogger
   onAssistantDelta?: (delta: string) => void
@@ -168,6 +180,28 @@ function createCustomToolDefinitions(customTools: CustomAgentTool[]): AgentToolD
         additionalProperties: false as const,
       },
     }))
+}
+
+function createMcpToolDefinitions(mcpTools: McpAgentTool[]): AgentToolDefinition[] {
+  return mcpTools.map((tool) => ({
+    name: `mcp:${tool.serverId}:${tool.name}`,
+    label: `${tool.serverName} / ${tool.name}`,
+    description: tool.description,
+    riskLevel: 'high' as const,
+    requiresPermission: true,
+    inputSchema: {
+      type: 'object' as const,
+      properties: Object.fromEntries(Object.entries(tool.inputSchema.properties ?? {}).map(([name, schema]) => [
+        name,
+        {
+          type: ['number', 'boolean'].includes(schema.type ?? '') ? schema.type as 'number' | 'boolean' : 'string' as const,
+          description: schema.description ?? name,
+        },
+      ])),
+      required: tool.inputSchema.required,
+      additionalProperties: false as const,
+    },
+  }))
 }
 
 function normalizeCalls(value: unknown, tools: AgentToolDefinition[], userText: string): AgentToolCall[] {
@@ -378,6 +412,17 @@ async function executeTool(
     return succeed(tool.name, `${tool.name} 返回：\n${result.content.slice(0, 8000)}`)
   }
 
+  if (call.name.startsWith('mcp:')) {
+    const [, serverId, ...toolNameParts] = call.name.split(':')
+    const toolName = toolNameParts.join(':')
+    const tool = options.mcpTools?.find((item) => item.serverId === serverId && item.name === toolName)
+    if (!tool) return fail('MCP Tool 不存在或 Server 已停用')
+    const allowed = await options.requestPermission(`${tool.serverName} / ${tool.name}`, `MCP Server 将执行：${tool.description}`)
+    if (!allowed) return fail(`用户拒绝调用 MCP Tool「${tool.name}」`)
+    const result = await window.electronAPI.invokeMcpTool(tool.serverId, tool.name, call.input)
+    return succeed(`${tool.serverName} / ${tool.name}`, result.content.slice(0, 8000))
+  }
+
   return fail('工具未注册')
 }
 
@@ -403,6 +448,7 @@ export async function runAgent(
   const tools: AgentToolDefinition[] = [
     ...(options.builtinTools ?? toolRegistry),
     ...createCustomToolDefinitions(customTools),
+    ...createMcpToolDefinitions(options.mcpTools ?? []),
   ]
 
   const orchestrator = new AgentOrchestrator({

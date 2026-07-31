@@ -1,5 +1,6 @@
 // React 渲染层的 Electron API 类型契约，必须与 preload 暴露的方法保持一致。
 import type { ScheduledAgentJob, ScheduledAgentJobDraft } from './automation/types'
+import type { McpServerConfig, McpServerDraft } from './mcp/types'
 export {}
 
 type SystemInfo = {
@@ -315,6 +316,11 @@ declare global {
       claimDueScheduledAgentJob: () => Promise<ScheduledAgentJob | null>
       claimScheduledAgentJobNow: (jobId: string) => Promise<ScheduledAgentJob | null>
       completeScheduledAgentJob: (jobId: string, success: boolean, result?: string) => Promise<ScheduledAgentJob | undefined>
+      getMcpServers: () => Promise<McpServerConfig[]>
+      saveMcpServer: (server: McpServerDraft | McpServerConfig) => Promise<McpServerConfig>
+      deleteMcpServer: (serverId: string) => Promise<{ deleted: boolean; id: string }>
+      discoverMcpServer: (serverId: string) => Promise<McpServerConfig>
+      invokeMcpTool: (serverId: string, toolName: string, input: Record<string, unknown>) => Promise<{ content: string; isError: boolean }>
       checkinPlan: (planId: string, note: string, progress?: number) => Promise<ButlerWorkspaceData>
       addActivity: (text: string) => Promise<ButlerWorkspaceData>
       deleteActivity: (activityId: string) => Promise<ButlerWorkspaceData>

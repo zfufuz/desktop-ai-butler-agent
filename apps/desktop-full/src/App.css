@@ -1470,6 +1470,97 @@ button:hover:not(:disabled) {
   }
 }
 
+.mcp-form {
+  display: grid;
+  gap: 8px;
+}
+
+.mcp-form input,
+.mcp-form textarea {
+  min-height: 42px;
+  border: 1px solid #ccd9dc;
+  border-radius: 6px;
+  padding: 9px 11px;
+  font: inherit;
+}
+
+.mcp-form textarea {
+  min-height: 86px;
+  resize: vertical;
+}
+
+.mcp-form .panel-action-button {
+  border-color: #10a99d;
+  background: #17b8aa;
+  color: #072f2d;
+}
+
+.mcp-server-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.mcp-server-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  border: 1px solid #d7e1e4;
+  border-radius: 7px;
+  padding: 12px;
+}
+
+.mcp-server-item > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.mcp-server-item code,
+.mcp-server-item small {
+  overflow: hidden;
+  color: #60717d;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-server-item > div:nth-child(2) {
+  display: flex;
+  gap: 4px;
+}
+
+.mcp-server-item > div:nth-child(2) button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid #d7e1e4;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.mcp-server-item ul {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+  margin: 2px 0 0;
+  padding: 9px 0 0;
+  border-top: 1px solid #e5ecee;
+  list-style: none;
+}
+
+.mcp-server-item li {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  gap: 8px;
+  font-size: 11px;
+}
+
+.mcp-server-item li span {
+  color: #60717d;
+}
+
 .automation-panel {
   display: flex;
   flex-direction: column;
