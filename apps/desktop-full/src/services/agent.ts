@@ -103,10 +103,6 @@ function shouldUseSystemInfoTool(userText: string) {
   return /系统|电脑|环境|配置|cpu|架构|平台|system|computer|env/i.test(userText)
 }
 
-function shouldUseAppVersionTool(userText: string) {
-  return /版本|version|app|应用/i.test(userText)
-}
-
 function shouldUseFileTool(userText: string) {
   return /文件|总结文件|读取文件|选择文件|日志|代码|file|summary|read/i.test(userText)
 }
@@ -123,6 +119,21 @@ function shouldListSchedule(userText: string) {
 
 function shouldFindFreeTime(userText: string) {
   return /空闲|空档|有时间|几点有空|find.*time|free.*time/i.test(userText)
+}
+
+export function isToolRelevantToRequest(toolName: string, userText: string) {
+  if (toolName.startsWith('custom:') || toolName.startsWith('mcp:')) return true
+
+  switch (toolName) {
+    case 'getSystemInfo': return shouldUseSystemInfoTool(userText)
+    case 'getAppVersion': return /(?:应用|软件|管家).{0,8}(?:版本|版本号)|版本号|version/i.test(userText)
+    case 'pickTextFile': return shouldUseFileTool(userText)
+    case 'queryKnowledgeBase': return shouldUseKnowledgeBaseTool(userText)
+    case 'listSchedule': return shouldListSchedule(userText)
+    case 'findFreeTime': return shouldFindFreeTime(userText)
+    case 'createScheduleEvent': return /创建|新增|安排到|加入日程|放到日历/i.test(userText)
+    default: return false
+  }
 }
 
 function currentDateKey(offsetDays = 0) {
@@ -144,8 +155,8 @@ function getFallbackCalls(userText: string): AgentToolCall[] {
     calls.push({ id: createCallId(), name, input, reason: '规则兜底命中' })
   }
 
-  if (shouldUseSystemInfoTool(userText)) add('getSystemInfo')
-  if (shouldUseAppVersionTool(userText)) add('getAppVersion')
+  if (isToolRelevantToRequest('getSystemInfo', userText)) add('getSystemInfo')
+  if (isToolRelevantToRequest('getAppVersion', userText)) add('getAppVersion')
   if (shouldUseFileTool(userText)) add('pickTextFile', { purpose: '读取用户指定的本地文件' })
   if (shouldUseKnowledgeBaseTool(userText)) add('queryKnowledgeBase', { query: userText })
   if (shouldFindFreeTime(userText)) {
@@ -214,6 +225,7 @@ function normalizeCalls(value: unknown, tools: AgentToolDefinition[], userText: 
       const raw = item as { name?: unknown; tool?: unknown; input?: unknown; reason?: unknown }
       const name = typeof raw.name === 'string' ? raw.name : typeof raw.tool === 'string' ? raw.tool : ''
       if (!allowedNames.has(name)) return null
+      if (!isToolRelevantToRequest(name, userText)) return null
 
       const input = raw.input && typeof raw.input === 'object'
         ? (raw.input as AgentToolCall['input'])
@@ -265,12 +277,14 @@ async function getModelDecision(
       actions?: unknown
       final?: unknown
     }
-    const calls = normalizeCalls(parsed.calls ?? parsed.actions, tools, userText)
+    const requestedCalls = parsed.calls ?? parsed.actions
+    const calls = normalizeCalls(requestedCalls, tools, userText)
+    const rejectedIrrelevantCalls = Array.isArray(requestedCalls) && requestedCalls.length > 0 && calls.length === 0
     logger(createToolLog('agent.decision', 'success', calls.length > 0 ? calls.map((call) => call.name).join(', ') : 'final'))
     return {
       thought: typeof parsed.thought === 'string' ? parsed.thought : undefined,
       calls,
-      final: typeof parsed.final === 'string' ? parsed.final : undefined,
+      final: typeof parsed.final === 'string' ? parsed.final : rejectedIrrelevantCalls ? '直接回答用户问题' : undefined,
     }
   } catch {
     logger(createToolLog('agent.decision', 'error', '模型决策失败，进入规则兜底'))

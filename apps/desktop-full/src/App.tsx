@@ -75,6 +75,26 @@ function getRegistryInventoryKind(text: string): RegistryInventoryKind | null {
   return null
 }
 
+function isCapabilityOverviewRequest(text: string) {
+  const normalized = text.trim().replace(/[？?。！!]/g, '')
+  return /^(?:你|您|这个(?:软件|应用|管家)|桌面AI管家)?(?:能|可以)(?:干|做|处理)(?:什么|哪些事|哪些事情)$/.test(normalized)
+    || /^(?:介绍|说)(?:一下)?(?:你|这个软件|这个应用|桌面AI管家)?(?:的)?(?:功能|能力)$/.test(normalized)
+}
+
+function createCapabilityOverviewReply() {
+  return `## 我能帮你做什么
+
+- **分析本地文件**：读取 Excel、CSV、Word、PDF、PPT、图片和代码，提炼结论与异常。
+- **把结论变成行动**：生成报告、计划、今日任务、提醒和日程，并持续记录进度。
+- **处理出差与办公事务**：结合天气、路线等已配置 Tool 生成行程、预算和报销清单。
+- **检索本地资料**：通过 BM25 与 Embedding 混合 RAG，从资料库中查找内容并标注来源。
+- **持续记住上下文**：保存对话记录，并使用短期对话和长期偏好辅助后续任务。
+- **自动执行任务**：按单次、每天或每周计划运行 Agent，并保留执行步骤、日志和结果。
+- **扩展能力**：可以安装 HTTP Tool、Prompt Skill 和 MCP Server，接入新的 API 与工具。
+
+你可以直接说一件具体的事，例如“分析这份销售表并生成下周计划”，也可以把文件拖进输入框。`
+}
+
 type ModelProviderConfig = {
   id: string
   name: string
@@ -1714,6 +1734,18 @@ ${sanitizeTripAdvice(reply.content)}`
     setAgentTimeline([])
 
     try {
+      if (isCapabilityOverviewRequest(text)) {
+        addTimelineStep({
+          id: createMessageId(),
+          title: '识别能力咨询',
+          detail: '直接读取当前产品能力，不调用无关工具',
+          status: 'success',
+          createdAt: Date.now(),
+        })
+        await streamAssistantMessage(createCapabilityOverviewReply())
+        return
+      }
+
       const inventoryKind = getRegistryInventoryKind(text)
       if (inventoryKind) {
         addTimelineStep({
