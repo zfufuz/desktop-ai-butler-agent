@@ -8,7 +8,6 @@ import {
   CalendarPlus,
   Download,
   FileText,
-  History,
   ListChecks,
   Pause,
   PanelLeftOpen,
@@ -3542,9 +3541,6 @@ ${result.content}
         </div>
 
         <div className="workspace-action-list">
-          <button onClick={() => setWorkspacePage('conversations')}>
-            <span><strong>对话记录</strong><small>恢复历史会话和短期上下文</small></span><b>{conversations.length}</b>
-          </button>
           <button onClick={() => setWorkspacePage('automations')}>
             <span><strong>自动任务</strong><small>定时运行 Agent 并通知结果</small></span><b>{scheduledJobs.filter((job) => job.enabled).length}</b>
           </button>
@@ -3579,7 +3575,6 @@ ${result.content}
     return (
       <nav className="workspace-tabs" aria-label="工作台视图">
         <button className={['home', 'plans', 'schedule', 'automations', 'reports', 'activity'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('home')}>任务</button>
-        <button className={workspacePage === 'conversations' ? 'active' : ''} onClick={() => setWorkspacePage('conversations')}>对话</button>
         <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>上下文</button>
         <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
       </nav>
@@ -3653,12 +3648,19 @@ ${result.content}
             systemInfoText={systemInfoText}
             statusText={getAssistantStatusText(assistantStatus)}
             activePage={workspacePage}
+            conversations={conversations}
+            activeConversationId={activeConversationId}
+            conversationBusy={isThinking}
             onNavigate={(page) => {
               setWorkspacePage(page)
               if (page === 'home') {
                 window.requestAnimationFrame(() => inputRef.current?.focus())
               }
             }}
+            onNewConversation={() => void startNewConversation()}
+            onOpenConversation={(conversationId) => void openConversation(conversationId)}
+            onDeleteConversation={(conversation) => void removeConversation(conversation)}
+            onShowAllConversations={() => setWorkspacePage('conversations')}
           />
         )}
       </aside>
@@ -3678,14 +3680,6 @@ ${result.content}
             <p>把资料、行程、计划和工具串起来，让事情更省心</p>
           </div>
           <div className="header-actions">
-            <button className="settings-button secondary" onClick={() => setWorkspacePage('conversations')} title="查看对话记录">
-              <History aria-hidden="true" size={17} />
-              <span>记录</span>
-            </button>
-            <button className="settings-button secondary" onClick={() => void startNewConversation()} disabled={!isElectronReady || isThinking} title="新建对话">
-              <Plus aria-hidden="true" size={17} />
-              <span>新对话</span>
-            </button>
             <button className="settings-button" onClick={() => setSettingsOpen(true)}>
               <Settings aria-hidden="true" size={17} />
               <span>设置</span>
@@ -4002,8 +3996,24 @@ ${result.content}
                 systemInfoText={systemInfoText}
                 statusText={getAssistantStatusText(assistantStatus)}
                 activePage={workspacePage}
+                conversations={conversations}
+                activeConversationId={activeConversationId}
+                conversationBusy={isThinking}
                 onNavigate={(page) => {
                   setWorkspacePage(page)
+                  setCompactDrawer(null)
+                }}
+                onNewConversation={() => {
+                  void startNewConversation()
+                  setCompactDrawer(null)
+                }}
+                onOpenConversation={(conversationId) => {
+                  void openConversation(conversationId)
+                  setCompactDrawer(null)
+                }}
+                onDeleteConversation={(conversation) => void removeConversation(conversation)}
+                onShowAllConversations={() => {
+                  setWorkspacePage('conversations')
                   setCompactDrawer(null)
                 }}
               />

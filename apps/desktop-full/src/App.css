@@ -383,6 +383,120 @@ button:hover:not(:disabled) {
   color: #73e7d6;
 }
 
+.sidebar-conversations {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 120px;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding-top: 14px;
+}
+
+.sidebar-conversations-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #91a39e;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.sidebar-conversations-heading button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #cbd8d4;
+}
+
+.sidebar-conversations-heading button:hover:not(:disabled),
+.sidebar-conversations-more:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  transform: none;
+}
+
+.sidebar-conversation-list {
+  display: grid;
+  gap: 3px;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+.sidebar-conversation-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  min-width: 0;
+  border-radius: 7px;
+}
+
+.sidebar-conversation-list > div:hover,
+.sidebar-conversation-list > div.active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-conversation-list > div.active {
+  box-shadow: inset 2px 0 #2dd4bf;
+}
+
+.sidebar-conversation-open {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  padding: 9px 8px;
+  color: #d6e0dd;
+  text-align: left;
+}
+
+.sidebar-conversation-open span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-conversation-delete {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #91a39e;
+  opacity: 0;
+}
+
+.sidebar-conversation-list > div:hover .sidebar-conversation-delete,
+.sidebar-conversation-list > div.active .sidebar-conversation-delete,
+.sidebar-conversation-delete:focus-visible {
+  opacity: 1;
+}
+
+.sidebar-conversation-delete:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fca5a5;
+  transform: none;
+}
+
+.sidebar-conversations-more {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  padding: 7px 8px;
+  color: #91a39e;
+  font-size: 12px;
+  text-align: left;
+}
+
 .avatar-meta span {
   display: flex;
   align-items: center;

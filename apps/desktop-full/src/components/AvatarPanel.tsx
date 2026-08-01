@@ -6,9 +6,12 @@ import {
   HardDrive,
   ListChecks,
   MessageSquare,
+  Plus,
   ShieldCheck,
+  Trash2,
   Workflow,
 } from 'lucide-react'
+import type { ConversationSummary } from '../type'
 
 export type AvatarNavigationPage = 'home' | 'plans' | 'schedule' | 'knowledge' | 'runs'
 
@@ -18,7 +21,14 @@ type AvatarPanelProps = {
   systemInfoText: string
   statusText: string
   activePage: string
+  conversations: ConversationSummary[]
+  activeConversationId: string | null
+  conversationBusy: boolean
   onNavigate: (page: AvatarNavigationPage) => void
+  onNewConversation: () => void
+  onOpenConversation: (conversationId: string) => void
+  onDeleteConversation: (conversation: ConversationSummary) => void
+  onShowAllConversations: () => void
 }
 
 const navigationItems: Array<{
@@ -39,7 +49,14 @@ function AvatarPanel({
   systemInfoText,
   statusText,
   activePage,
+  conversations,
+  activeConversationId,
+  conversationBusy,
   onNavigate,
+  onNewConversation,
+  onOpenConversation,
+  onDeleteConversation,
+  onShowAllConversations,
 }: AvatarPanelProps) {
   return (
     <section className="avatar-panel">
@@ -68,6 +85,37 @@ function AvatarPanel({
             )
           })}
         </nav>
+
+        <section className="sidebar-conversations" aria-label="对话记录">
+          <div className="sidebar-conversations-heading">
+            <span>对话</span>
+            <button onClick={onNewConversation} disabled={conversationBusy} title="新建对话" aria-label="新建对话">
+              <Plus aria-hidden="true" size={15} />
+            </button>
+          </div>
+          <div className="sidebar-conversation-list">
+            {conversations.slice(0, 12).map((conversation) => (
+              <div className={conversation.id === activeConversationId ? 'active' : ''} key={conversation.id}>
+                <button className="sidebar-conversation-open" onClick={() => onOpenConversation(conversation.id)} title={conversation.title}>
+                  <MessageSquare aria-hidden="true" size={14} />
+                  <span>{conversation.title}</span>
+                </button>
+                <button
+                  className="sidebar-conversation-delete"
+                  onClick={() => onDeleteConversation(conversation)}
+                  disabled={conversationBusy}
+                  title="删除对话"
+                  aria-label={`删除对话：${conversation.title}`}
+                >
+                  <Trash2 aria-hidden="true" size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+          {conversations.length > 0 && (
+            <button className="sidebar-conversations-more" onClick={onShowAllConversations}>管理全部对话</button>
+          )}
+        </section>
 
         <div className="avatar-meta">
           <span><HardDrive aria-hidden="true" size={15} />{systemInfoText || '正在读取系统信息'}</span>
