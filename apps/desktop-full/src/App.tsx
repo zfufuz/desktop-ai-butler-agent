@@ -2149,7 +2149,11 @@ ${fileContext}`,
     setAssistantStatus('thinking')
     setAgentTimeline([])
     try {
-      await executeAgentRequest(previousUser.content)
+      if (isCapabilityOverviewRequest(previousUser.content)) {
+        await streamAssistantMessage(createCapabilityOverviewReply())
+      } else {
+        await executeAgentRequest(previousUser.content)
+      }
     } catch {
       await streamAssistantMessage('重新生成失败，请检查模型连接后再试。')
     } finally {
