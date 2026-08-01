@@ -6,4 +6,12 @@ export type Message = {
   createdAt: number
 }
 
+export type ConversationSummary = {
+  id: string
+  title: string
+  messageCount: number
+  createdAt: number
+  updatedAt: number
+}
+
 export type AssistantStatus = 'idle' | 'thinking'

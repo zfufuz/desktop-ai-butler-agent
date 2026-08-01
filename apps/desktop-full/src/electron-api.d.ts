@@ -252,6 +252,21 @@ type MemoryNote = {
   updatedAt: number
 }
 
+type ConversationMessage = {
+  id: number
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: number
+}
+
+type ConversationSummary = {
+  id: string
+  title: string
+  messageCount: number
+  createdAt: number
+  updatedAt: number
+}
+
 declare global {
   interface Window {
     electronAPI: {
@@ -300,6 +315,11 @@ declare global {
       addMemoryNote: (text: string, category?: MemoryNote['category'], expiresAt?: number) => Promise<MemoryNote[]>
       updateMemoryNote: (noteId: string, patch: Partial<Pick<MemoryNote, 'text' | 'category' | 'pinned' | 'expiresAt'>>) => Promise<MemoryNote[]>
       deleteMemoryNote: (noteId: string) => Promise<MemoryNote[]>
+      getConversations: () => Promise<ConversationSummary[]>
+      createConversation: () => Promise<ConversationSummary>
+      loadConversation: (conversationId: string) => Promise<{ conversation: ConversationSummary; messages: ConversationMessage[] }>
+      saveConversation: (conversationId: string, messages: ConversationMessage[]) => Promise<ConversationSummary[]>
+      deleteConversation: (conversationId: string) => Promise<{ deleted: boolean; id: string }>
       saveReport: (report: Omit<ButlerReport, 'id' | 'createdAt'>) => Promise<ButlerWorkspaceData>
       deleteReport: (reportId: string) => Promise<ButlerWorkspaceData>
       savePlan: (

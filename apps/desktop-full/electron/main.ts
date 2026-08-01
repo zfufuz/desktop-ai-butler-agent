@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite'
 import mammoth from 'mammoth'
 import { PDFParse } from 'pdf-parse'
 import { chunkKnowledgeContent, createKnowledgeSearchTerms } from './knowledge-utils.js'
+import { deriveConversationTitle, normalizeConversationMessages } from './conversation-utils.js'
 import { readXlsxFile } from './excel-parser.js'
 import { compressKnowledgeContext, cosineSimilarity, decodeEmbeddingVector, encodeEmbeddingVector, rerankHybridCandidates, type HybridCandidate } from './rag-utils.js'
 import { extractToolResponse, hasToolBusinessError, prepareToolRequest, type ToolInputSchema, type ToolRequestMapping } from './tool-runtime.js'
@@ -673,6 +674,20 @@ function initializeDatabase() {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '新对话',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS conversation_messages (
+      id REAL PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS agent_runs (
       id TEXT PRIMARY KEY,
       goal TEXT NOT NULL,
@@ -723,6 +738,8 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_schedule_events_plan_id ON schedule_events(plan_id);
     CREATE INDEX IF NOT EXISTS idx_scheduled_agent_jobs_due ON scheduled_agent_jobs(enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_memory_notes_created_at ON memory_notes(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation ON conversation_messages(conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at ON agent_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_category ON audit_logs(category, created_at DESC);
@@ -1882,6 +1899,8 @@ function clearUserData() {
       DELETE FROM plans;
       DELETE FROM activities;
       DELETE FROM memory_notes;
+      DELETE FROM conversation_messages;
+      DELETE FROM conversations;
       DELETE FROM agent_runs;
       DELETE FROM knowledge_chunks_fts;
       DELETE FROM knowledge_documents;
@@ -1962,6 +1981,75 @@ function updateMemoryNote(noteId: string, patch: unknown) {
     .prepare('UPDATE memory_notes SET text = ?, category = ?, pinned = ?, expires_at = ?, updated_at = ? WHERE id = ?')
     .run(text, category, pinned, expiresAt, Date.now(), current.id)
   return readMemoryNotes()
+}
+
+function readConversationSummaries() {
+  return initializeDatabase()
+    .prepare(`SELECT c.id, c.title, c.created_at AS createdAt, c.updated_at AS updatedAt,
+      COUNT(m.id) AS messageCount
+      FROM conversations c
+      LEFT JOIN conversation_messages m ON m.conversation_id = c.id
+      GROUP BY c.id
+      ORDER BY c.updated_at DESC
+      LIMIT 100`)
+    .all()
+}
+
+function createConversation() {
+  const now = Date.now()
+  const conversation = { id: createId('conversation'), title: '新对话', messageCount: 0, createdAt: now, updatedAt: now }
+  initializeDatabase()
+    .prepare('INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)')
+    .run(conversation.id, conversation.title, now, now)
+  return conversation
+}
+
+function readConversation(conversationId: string) {
+  const safeId = String(conversationId).slice(0, 160)
+  const conversation = initializeDatabase()
+    .prepare('SELECT id, title, created_at AS createdAt, updated_at AS updatedAt FROM conversations WHERE id = ?')
+    .get(safeId)
+  if (!conversation) throw new Error('Conversation not found')
+
+  const messages = initializeDatabase()
+    .prepare(`SELECT id, role, content, created_at AS createdAt
+      FROM conversation_messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC`)
+    .all(safeId)
+  return { conversation, messages }
+}
+
+function saveConversation(conversationId: string, rawMessages: unknown) {
+  const safeId = String(conversationId).slice(0, 160)
+  const messages = normalizeConversationMessages(rawMessages)
+  const title = deriveConversationTitle(messages)
+  const now = Date.now()
+  const db = initializeDatabase()
+  const existing = db.prepare('SELECT created_at AS createdAt FROM conversations WHERE id = ?').get(safeId) as { createdAt: number } | undefined
+  const createdAt = existing?.createdAt ?? now
+
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare(`INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at`)
+      .run(safeId, title, createdAt, now)
+    db.prepare('DELETE FROM conversation_messages WHERE conversation_id = ?').run(safeId)
+    const insert = db.prepare('INSERT INTO conversation_messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)')
+    for (const message of messages) {
+      insert.run(message.id, safeId, message.role, message.content, message.createdAt)
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+
+  return readConversationSummaries()
+}
+
+function deleteConversation(conversationId: string) {
+  const safeId = String(conversationId).slice(0, 160)
+  const result = initializeDatabase().prepare('DELETE FROM conversations WHERE id = ?').run(safeId)
+  return { deleted: result.changes > 0, id: safeId }
 }
 
 function appendActivity(data: ButlerWorkspaceData, activity: Omit<ButlerActivity, 'id' | 'createdAt'>) {
@@ -3157,6 +3245,28 @@ ipcMain.handle('memory:delete', (_event, noteId: string) => {
   const notes = deleteMemoryNote(noteId)
   writeAuditLog({ category: 'workflow', action: 'memory.delete', summary: '已删除长期记忆', metadata: { noteId } })
   return notes
+})
+
+ipcMain.handle('conversation:list', () => readConversationSummaries())
+
+ipcMain.handle('conversation:create', () => {
+  const conversation = createConversation()
+  writeAuditLog({ category: 'workflow', action: 'conversation.create', summary: '已新建对话', metadata: { conversationId: conversation.id } })
+  return conversation
+})
+
+ipcMain.handle('conversation:load', (_event, conversationId: string) => {
+  return readConversation(conversationId)
+})
+
+ipcMain.handle('conversation:save', (_event, conversationId: string, messages: unknown) => {
+  return saveConversation(conversationId, messages)
+})
+
+ipcMain.handle('conversation:delete', (_event, conversationId: string) => {
+  const result = deleteConversation(conversationId)
+  writeAuditLog({ category: 'workflow', action: 'conversation.delete', summary: '已删除对话记录', metadata: { conversationId } })
+  return result
 })
 
 ipcMain.handle('workflow:save-report', (_event, report: Omit<ButlerReport, 'id' | 'createdAt'>) => {

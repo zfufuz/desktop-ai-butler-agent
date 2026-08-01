@@ -8,6 +8,7 @@ import {
   CalendarPlus,
   Download,
   FileText,
+  History,
   ListChecks,
   Pause,
   PanelLeftOpen,
@@ -15,6 +16,7 @@ import {
   Pin,
   Plane,
   Play,
+  Plus,
   ReceiptText,
   Settings,
   Square,
@@ -49,7 +51,7 @@ import { toolRegistry } from './agent/toolRegistry'
 import type { AgentRun } from './agent/protocol'
 import { wrapUntrustedCollection, wrapUntrustedContent } from './agent/security'
 import { getSkillDefinition, skillRegistry, type SkillId } from './skills/skillRegistry'
-import type { AssistantStatus, Message } from './type'
+import type { AssistantStatus, ConversationSummary, Message } from './type'
 import type { ScheduledAgentJob } from './automation/types'
 import type { McpServerConfig } from './mcp/types'
 
@@ -59,7 +61,7 @@ type ProductMode = 'user' | 'developer'
 type PendingFileReadStep = 'awaitingConsent' | 'awaitingScope' | null
 type PendingTripStep = 'awaitingDetails' | null
 type SettingsPage = 'home' | 'provider' | 'integrations' | 'rag' | 'skill' | 'tool' | 'mcp' | 'installed' | 'extensions' | 'advanced' | 'data'
-type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'automations' | 'activity' | 'memory'
+type WorkspacePage = 'home' | 'data' | 'knowledge' | 'runs' | 'metrics' | 'eval' | 'logs' | 'reports' | 'plans' | 'schedule' | 'automations' | 'activity' | 'memory' | 'conversations'
 type ButlerScenario = 'file' | 'trip' | 'study' | 'workReport' | 'expense' | 'today'
 type RegistryInventoryKind = 'skill' | 'tool'
 type ProviderType = 'mock' | 'zhipu' | 'openai-compatible'
@@ -237,6 +239,12 @@ type MemoryNote = {
 
 function createMessageId() {
   return Date.now() + Math.random()
+}
+
+const WELCOME_MESSAGE = '你好，我是桌面 AI 管家。你可以把文件、行程、计划或目标交给我，我会把它们整理成报告、今日任务、提醒和后续跟踪；切换到开发者模式后，还可以配置模型、Skill 和 HTTP API Tool。'
+
+function createWelcomeMessage(): Message {
+  return { id: createMessageId(), role: 'assistant', content: WELCOME_MESSAGE, createdAt: Date.now() }
 }
 
 function parseOptionalJsonObject<T>(text: string, label: string): T | undefined {
@@ -653,15 +661,9 @@ function App() {
     bodyParamsJson: '',
     responsePath: '',
   })
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: 1,
-      role: 'assistant',
-      content:
-        '你好，我是桌面 AI 管家。你可以把文件、行程、计划或目标交给我，我会把它们整理成报告、今日任务、提醒和后续跟踪；切换到开发者模式后，还可以配置模型、Skill 和 HTTP API Tool。',
-      createdAt: Date.now(),
-    },
-  ])
+  const [messages, setMessages] = useState<Message[]>(() => [createWelcomeMessage()])
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
 
   const isThinking = assistantStatus === 'thinking'
   const activeProvider = platformConfig?.providers.find(
@@ -697,6 +699,7 @@ function App() {
   const agentPauseRequestedRef = useRef(false)
   const hasSyncedKnowledgeRef = useRef(false)
   const hasSyncedMemoryRef = useRef(false)
+  const hasLoadedConversationRef = useRef(false)
 
   function addToolLog(log: ToolCallLog) {
     setToolLogs((currentLogs) => [log, ...currentLogs].slice(0, 8))
@@ -794,6 +797,14 @@ function App() {
     window.electronAPI.getScheduledAgentJobs().then(setScheduledJobs)
     window.electronAPI.getMcpServers().then(setMcpServers)
     window.electronAPI.getAuditLogs({ limit: 100 }).then(setAuditLogs)
+    window.electronAPI.getConversations().then(async (storedConversations) => {
+      const activeConversation = storedConversations[0] ?? await window.electronAPI.createConversation()
+      const loaded = await window.electronAPI.loadConversation(activeConversation.id)
+      setConversations(storedConversations.length > 0 ? storedConversations : [activeConversation])
+      setActiveConversationId(activeConversation.id)
+      setMessages(loaded.messages.length > 0 ? loaded.messages : [createWelcomeMessage()])
+      hasLoadedConversationRef.current = true
+    })
     window.electronAPI.getMemoryNotes().then(async (storedNotes) => {
       const legacyNotes = readJsonFromStorage<string[]>('ai-butler:memoryNotes', [])
       const nextNotes = legacyNotes.length > 0
@@ -897,6 +908,15 @@ function App() {
     if (isElectronReady && hasSyncedMemoryRef.current) return
     localStorage.setItem('ai-butler:memoryNotes', JSON.stringify(memoryNotes.map((note) => note.text)))
   }, [isElectronReady, memoryNotes])
+
+  useEffect(() => {
+    if (!isElectronReady || !activeConversationId || !hasLoadedConversationRef.current) return
+
+    const saveTimer = window.setTimeout(() => {
+      window.electronAPI.saveConversation(activeConversationId, messages).then(setConversations)
+    }, 600)
+    return () => window.clearTimeout(saveTimer)
+  }, [activeConversationId, isElectronReady, messages])
 
   useEffect(() => {
     localStorage.setItem('ai-butler:builtinSkillOverrides', JSON.stringify(builtinSkillOverrides))
@@ -1570,6 +1590,12 @@ ${sanitizeTripAdvice(reply.content)}`
     const memoryContext = memoryNotes.length > 0
       ? `\n\n用户长期记忆：\n${memoryNotes.map((note) => note.text).join('\n')}`
       : ''
+    const conversationContext = messages.length > 1
+      ? `\n\n最近对话：\n${messages
+        .slice(-12)
+        .map((message) => `${message.role === 'user' ? '用户' : '管家'}：${message.content.slice(0, 1500)}`)
+        .join('\n')}`
+      : ''
     let streamedMessageId: number | null = null
     let streamedContent = ''
     const controller = new AbortController()
@@ -1596,7 +1622,7 @@ ${sanitizeTripAdvice(reply.content)}`
           description: tool.description,
           inputSchema: tool.inputSchema,
         }))),
-      context: `${modeHint}${memoryContext}`,
+      context: `${modeHint}${memoryContext}${conversationContext}`,
       onTimeline: addTimelineStep,
       requestPermission: requestToolPermission,
       onRunUpdate: persistAgentRun,
@@ -2196,6 +2222,56 @@ ${fileContext}`,
     setMemoryNotes([])
     setAgentRuns([])
     setAuditLogs(await window.electronAPI.getAuditLogs({ limit: 300 }))
+    const conversation = await window.electronAPI.createConversation()
+    setActiveConversationId(conversation.id)
+    setConversations([conversation])
+    setMessages([createWelcomeMessage()])
+  }
+
+  async function startNewConversation() {
+    if (!isElectronReady || isThinking) return
+    if (activeConversationId) {
+      await window.electronAPI.saveConversation(activeConversationId, messages)
+    }
+    const conversation = await window.electronAPI.createConversation()
+    setActiveConversationId(conversation.id)
+    setMessages([createWelcomeMessage()])
+    setConversations(await window.electronAPI.getConversations())
+    setAgentTimeline([])
+    setPendingAttachments([])
+    setPendingReportCard(null)
+    setTripResultCard(null)
+    setWorkspacePage('home')
+    window.requestAnimationFrame(() => inputRef.current?.focus())
+  }
+
+  async function openConversation(conversationId: string) {
+    if (!isElectronReady || isThinking || conversationId === activeConversationId) return
+    if (activeConversationId) {
+      await window.electronAPI.saveConversation(activeConversationId, messages)
+    }
+    const loaded = await window.electronAPI.loadConversation(conversationId)
+    setActiveConversationId(conversationId)
+    setMessages(loaded.messages.length > 0 ? loaded.messages : [createWelcomeMessage()])
+    setAgentTimeline([])
+    setWorkspacePage('home')
+  }
+
+  async function removeConversation(conversation: ConversationSummary) {
+    if (!isElectronReady || isThinking || !window.confirm(`确定删除对话“${conversation.title}”？`)) return
+    await window.electronAPI.deleteConversation(conversation.id)
+    const remaining = await window.electronAPI.getConversations()
+    if (conversation.id !== activeConversationId) {
+      setConversations(remaining)
+      return
+    }
+
+    const nextConversation = remaining[0] ?? await window.electronAPI.createConversation()
+    const loaded = await window.electronAPI.loadConversation(nextConversation.id)
+    setActiveConversationId(nextConversation.id)
+    setMessages(loaded.messages.length > 0 ? loaded.messages : [createWelcomeMessage()])
+    setConversations(remaining.length > 0 ? remaining : [nextConversation])
+    setWorkspacePage('home')
   }
 
   async function rememberCurrentGoal() {
@@ -3027,6 +3103,32 @@ ${result.content}
   }
 
   function renderWorkspaceDetail() {
+    if (workspacePage === 'conversations') {
+      return (
+        <div className="insight-section conversation-history">
+          <div className="conversation-history-heading">
+            <div><h3>对话记录</h3><p>会话保存在本机，重新打开软件后可以继续。</p></div>
+            <button className="panel-action-button compact" onClick={() => void startNewConversation()} disabled={!isElectronReady || isThinking}>
+              <Plus size={16} />新对话
+            </button>
+          </div>
+          <div className="conversation-history-list">
+            {conversations.map((conversation) => (
+              <article className={conversation.id === activeConversationId ? 'active' : ''} key={conversation.id}>
+                <button className="conversation-open-button" onClick={() => void openConversation(conversation.id)}>
+                  <strong>{conversation.title}</strong>
+                  <span>{conversation.messageCount} 条消息 · {new Date(conversation.updatedAt).toLocaleString('zh-CN')}</span>
+                </button>
+                <button className="icon-button" title="删除对话" onClick={() => void removeConversation(conversation)} disabled={isThinking}>
+                  <Trash2 size={15} />
+                </button>
+              </article>
+            ))}
+          </div>
+        </div>
+      )
+    }
+
     if (workspacePage === 'schedule') {
       return (
         <SchedulePanel
@@ -3404,6 +3506,9 @@ ${result.content}
         </div>
 
         <div className="workspace-action-list">
+          <button onClick={() => setWorkspacePage('conversations')}>
+            <span><strong>对话记录</strong><small>恢复历史会话和短期上下文</small></span><b>{conversations.length}</b>
+          </button>
           <button onClick={() => setWorkspacePage('automations')}>
             <span><strong>自动任务</strong><small>定时运行 Agent 并通知结果</small></span><b>{scheduledJobs.filter((job) => job.enabled).length}</b>
           </button>
@@ -3438,6 +3543,7 @@ ${result.content}
     return (
       <nav className="workspace-tabs" aria-label="工作台视图">
         <button className={['home', 'plans', 'schedule', 'automations', 'reports', 'activity'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('home')}>任务</button>
+        <button className={workspacePage === 'conversations' ? 'active' : ''} onClick={() => setWorkspacePage('conversations')}>对话</button>
         <button className={workspacePage === 'knowledge' || workspacePage === 'memory' ? 'active' : ''} onClick={() => setWorkspacePage('knowledge')}>上下文</button>
         <button className={['runs', 'metrics', 'logs', 'eval'].includes(workspacePage) ? 'active' : ''} onClick={() => setWorkspacePage('runs')}>执行</button>
       </nav>
@@ -3536,6 +3642,14 @@ ${result.content}
             <p>把资料、行程、计划和工具串起来，让事情更省心</p>
           </div>
           <div className="header-actions">
+            <button className="settings-button secondary" onClick={() => setWorkspacePage('conversations')} title="查看对话记录">
+              <History aria-hidden="true" size={17} />
+              <span>记录</span>
+            </button>
+            <button className="settings-button secondary" onClick={() => void startNewConversation()} disabled={!isElectronReady || isThinking} title="新建对话">
+              <Plus aria-hidden="true" size={17} />
+              <span>新对话</span>
+            </button>
             <button className="settings-button" onClick={() => setSettingsOpen(true)}>
               <Settings aria-hidden="true" size={17} />
               <span>设置</span>
